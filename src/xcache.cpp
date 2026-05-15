@@ -30,6 +30,7 @@
 #include <cerrno>
 #include <fcntl.h>
 #include <mutex>
+#include <optional>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <thread>

@@ -28,17 +28,11 @@
 
 extern "C" {
 
-static _Thread_local xcache_error_t g_errno = XCACHE_OK;
-
-xcache_error_t xcache_errno(void) { return g_errno; }
-
 static xcache_t* open_impl(const char* path, size_t block_size, int multi_process, uint32_t init_slots) {
-    g_errno = XCACHE_OK;
-    if (!path) { g_errno = XCACHE_INVALID_ARG; return nullptr; }
+    if (!path) { return nullptr; }
     if (block_size == 0) { block_size = 256UL << 10; }
     if (init_slots == 0) { init_slots = 65536; }
     auto* kv = new (std::nothrow) xcache::XCache(path, block_size, multi_process != 0, init_slots);
-    if (!kv) { g_errno = XCACHE_NO_SPACE; return nullptr; }
     return reinterpret_cast<xcache_t*>(kv);
 }
 
