@@ -1,0 +1,2 @@
+add_executable(xcache_example xcache_example.cpp)
+target_link_libraries(xcache_example PRIVATE xcache)

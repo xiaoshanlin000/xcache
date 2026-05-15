@@ -1,0 +1,16 @@
+@PACKAGE_INIT@
+
+set_and_check(XCACHE_INCLUDE_DIR "@PACKAGE_CMAKE_INSTALL_INCLUDEDIR@")
+set_and_check(XCACHE_LIBRARY_DIR "@PACKAGE_CMAKE_INSTALL_LIBDIR@")
+
+if(NOT TARGET xcache::xcache)
+    add_library(xcache::xcache STATIC IMPORTED)
+    set_target_properties(xcache::xcache PROPERTIES
+        IMPORTED_LOCATION "${XCACHE_LIBRARY_DIR}/${CMAKE_STATIC_LIBRARY_PREFIX}xcache${CMAKE_STATIC_LIBRARY_SUFFIX}"
+        INTERFACE_INCLUDE_DIRECTORIES "${XCACHE_INCLUDE_DIR}"
+        INTERFACE_COMPILE_FEATURES "cxx_std_17"
+        INTERFACE_LINK_LIBRARIES "Threads::Threads"
+    )
+endif()
+
+check_required_components(xcache)

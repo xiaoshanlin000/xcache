@@ -1,0 +1,44 @@
+# Build
+build*/
+cmake-build-*/
+out/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.vs/
+*.user
+*.suo
+.clangd
+
+# Compiled
+*.o
+*.obj
+*.exe
+*.dll
+*.dylib
+*.so
+*.a
+*.lib
+
+# Testing
+Testing/
+**/CTestTestfile.cmake
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# macOS
+.DS_Store
+
+# Misc
+*.log
+*.bak
+*.orig
