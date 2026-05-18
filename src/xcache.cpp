@@ -329,50 +329,33 @@ struct XCache::Impl {
 
     // ── typed get helpers ─────────────────────────────────────────
 
-    xcache_error_t key_get_string(const std::string& key, std::string* out) const {
-        auto h  = XXH3_64bits(key.data(), key.size());
-        auto N  = hdr()->num_slots;
-        for (size_t i = 0; i < N; ++i) {
-            auto& s = slot((h + i) % N);
-            auto  v = s.state.load(std::memory_order_acquire);
-            if (v == kEmpty) { return XCACHE_NOT_FOUND; }
-            if (v == kTomb) { continue; }
-            uint64_t bid, off;
-            decode_slot(v, bid, off);
-            auto [k, vt] = read_key_type(bid, off);
-            if (k != key) { continue; }
-            if (vt != XCACHE_TEXT) { return XCACHE_TYPE_MISMATCH; }
-            auto rec = read_record(bid, off);
-            if (rec.expired) { return XCACHE_EXPIRED; }
-            *out = std::move(rec.raw_val);
-            return XCACHE_OK;
-        }
-        return XCACHE_NOT_FOUND;
-    }
-
     template <typename F>
     xcache_error_t key_get_typed(const std::string& key,
                                   xcache_value_type_t expected,
                                   F&& parse,
                                   decltype(parse(std::declval<Record>()))* out) const {
+        if (!idx_map_) { return XCACHE_IO_ERROR; }
+        enter_read();
         using T = decltype(parse(std::declval<Record>()));
         auto h  = XXH3_64bits(key.data(), key.size());
         auto N  = hdr()->num_slots;
         for (size_t i = 0; i < N; ++i) {
             auto& s = slot((h + i) % N);
             auto  v = s.state.load(std::memory_order_acquire);
-            if (v == kEmpty) { return XCACHE_NOT_FOUND; }
+            if (v == kEmpty) { exit_read(); return XCACHE_NOT_FOUND; }
             if (v == kTomb) { continue; }
             uint64_t bid, off;
             decode_slot(v, bid, off);
             auto [k, vt] = read_key_type(bid, off);
             if (k != key) { continue; }
-            if (vt != expected) { return XCACHE_TYPE_MISMATCH; }
+            if (vt != expected) { exit_read(); return XCACHE_TYPE_MISMATCH; }
             auto rec = read_record(bid, off);
-            if (rec.expired) { return XCACHE_EXPIRED; }
+            if (rec.expired) { exit_read(); return XCACHE_EXPIRED; }
             *out = T(parse(std::move(rec)));
+            exit_read();
             return XCACHE_OK;
         }
+        exit_read();
         return XCACHE_NOT_FOUND;
     }
 
@@ -404,16 +387,6 @@ struct XCache::Impl {
         }
         exit_write();
         return XCACHE_OK;
-    }
-
-    // ── lookup ────────────────────────────────────────────────────
-
-    xcache_error_t get_key(const std::string& key, std::string* out) const {
-        return key_get_string(key, out);
-    }
-
-    xcache_error_t get_key(const std::string& key, std::string* out) {
-        return const_cast<const Impl*>(this)->get_key(key, out);
     }
 
     // ── insert ────────────────────────────────────────────────────
