@@ -258,35 +258,45 @@ struct XCache::Impl {
 
     // ── pack / read / write ────────────────────────────────────────
 
-    static uint32_t packed_size(const std::string& key, uint32_t val_size) {
-        uint32_t ksz = static_cast<uint32_t>(key.size());
-        uint32_t kp  = (ksz + 3) & ~3u;
-        return (4 + kp + 4 + 4 + 8 + val_size + 7) & ~7u;
+    static size_t packed_size(const std::string& key, size_t val_size) {
+        size_t ksz = key.size();
+        size_t kp  = (ksz + 3) & ~3ull;
+        return (4 + kp + 4 + 4 + 8 + val_size + 7) & ~7ull;
     }
 
     void write_record(uint64_t bid, uint64_t off,
                       const std::string& key, xcache_value_type_t type,
-                      const void* data, uint32_t size,
+                      const void* data, size_t size,
                       uint64_t expire_at) const {
         auto p = static_cast<char*>(blk_maps_[bid]) + off;
         uint32_t ksz = static_cast<uint32_t>(key.size());
         uint32_t kp  = (ksz + 3) & ~3u;
+        uint32_t vsz = static_cast<uint32_t>(size);
         size_t o = 0;
         std::memcpy(p + o, &ksz, 4); o += 4;
         std::memcpy(p + o, key.data(), ksz); o += kp;  // NOLINT: binary key with explicit size, not a C string
         uint32_t vt = static_cast<uint32_t>(type);
         std::memcpy(p + o, &vt, 4); o += 4;
-        std::memcpy(p + o, &size, 4); o += 4;
+        std::memcpy(p + o, &vsz, 4); o += 4;
         std::memcpy(p + o, &expire_at, 8); o += 8;
         std::memcpy(p + o, data, size);
     }
 
     Record read_record(uint64_t bid, uint64_t off) const {
+        if (bid >= num_blks_) { return {std::string{}, XCACHE_TEXT, std::string{}, true}; }
+        if (!blk_maps_[bid] || blk_maps_[bid] == MAP_FAILED) {
+            return {std::string{}, XCACHE_TEXT, std::string{}, true};
+        }
+        auto raw = blk_alloc(bid).raw.load(std::memory_order_relaxed);
+        auto bsz = blk_sz_of(raw);
         auto p0 = static_cast<const char*>(blk_maps_[bid]) + off;
-
+        if (off + 4 > bsz) { return {std::string{}, XCACHE_TEXT, std::string{}, true}; }
         uint32_t ksz;
         std::memcpy(&ksz, p0, 4);
         auto kp = (ksz + 3) & ~3u;
+        if (off + 4 + kp + 4 + 4 + 8 > bsz) {
+            return {std::string{}, XCACHE_TEXT, std::string{}, true};
+        }
         std::string key(p0 + 4, ksz);
 
         auto p = p0 + 4 + kp;
@@ -301,26 +311,45 @@ struct XCache::Impl {
     }
 
     std::string read_key(uint64_t bid, uint64_t off) const {
+        if (bid >= num_blks_) { return {}; }
+        if (!blk_maps_[bid] || blk_maps_[bid] == MAP_FAILED) { return {}; }
+        auto raw = blk_alloc(bid).raw.load(std::memory_order_relaxed);
+        auto bsz = blk_sz_of(raw);
         auto p0 = static_cast<const char*>(blk_maps_[bid]) + off;
+        if (off + 4 > bsz) { return {}; }
         uint32_t ksz;
         std::memcpy(&ksz, p0, 4);
+        auto kp = (ksz + 3) & ~3u;
+        if (off + 4 + kp + 4 + 4 + 8 > bsz) { return {}; }
         return std::string(p0 + 4, ksz);
     }
 
     bool is_expired(uint64_t bid, uint64_t off) const {
+        if (bid >= num_blks_) { return true; }
+        if (!blk_maps_[bid] || blk_maps_[bid] == MAP_FAILED) { return true; }
+        auto raw = blk_alloc(bid).raw.load(std::memory_order_relaxed);
+        auto bsz = blk_sz_of(raw);
         auto p0 = static_cast<const char*>(blk_maps_[bid]) + off;
+        if (off + 4 > bsz) { return true; }
         uint32_t ksz; std::memcpy(&ksz, p0, 4);
         auto kp = (ksz + 3) & ~3u;
+        if (off + 4 + kp + 4 + 4 + 8 > bsz) { return true; }
         auto p = p0 + 4 + kp + 4 + 4;
         uint64_t expire_at; std::memcpy(&expire_at, p, 8);
         return expire_at != 0 && static_cast<uint64_t>(std::time(nullptr)) > expire_at;
     }
 
     std::pair<std::string, xcache_value_type_t> read_key_type(uint64_t bid, uint64_t off) const {
+        if (bid >= num_blks_) { return {{}, XCACHE_TEXT}; }
+        if (!blk_maps_[bid] || blk_maps_[bid] == MAP_FAILED) { return {{}, XCACHE_TEXT}; }
+        auto raw = blk_alloc(bid).raw.load(std::memory_order_relaxed);
+        auto bsz = blk_sz_of(raw);
         auto p0 = static_cast<const char*>(blk_maps_[bid]) + off;
+        if (off + 4 > bsz) { return {{}, XCACHE_TEXT}; }
         uint32_t ksz;
         std::memcpy(&ksz, p0, 4);
         auto kp = (ksz + 3) & ~3u;
+        if (off + 4 + kp + 4 + 4 + 8 > bsz) { return {{}, XCACHE_TEXT}; }
         std::string key(p0 + 4, ksz);
         auto p = p0 + 4 + kp;
         uint32_t vt; std::memcpy(&vt, p, 4);
@@ -362,9 +391,10 @@ struct XCache::Impl {
     xcache_error_t put_typed(const std::string& key,
                               xcache_value_type_t type,
                               const void* data,
-                              uint32_t size,
+                              size_t size,
                               uint32_t expire_seconds = 0) {
         if (!idx_map_) { return XCACHE_IO_ERROR; }
+        if (size > (1UL << 30)) { return XCACHE_INVALID_ARG; }
         enter_write();
         auto expire_at = expire_seconds ? static_cast<uint64_t>(std::time(nullptr)) + expire_seconds : 0ULL;
         auto tot = packed_size(key, size);
@@ -409,6 +439,7 @@ struct XCache::Impl {
                     }
                     return true;
                 }
+                --i;
                 continue;
             }
             uint64_t eb, eo;
@@ -419,6 +450,7 @@ struct XCache::Impl {
                         std::memory_order_relaxed)) {
                     return true;
                 }
+                --i;
                 continue;
             }
         }
@@ -457,9 +489,9 @@ struct XCache::Impl {
     bool create_block(uint64_t need) {
         std::lock_guard<std::mutex> lk(grow_mtx_);
         auto* h = hdr();
-        auto nb = h->num_blocks.load(std::memory_order_relaxed);
+        auto nb = h->num_blocks.load(std::memory_order_acquire);
         if (nb >= h->max_blocks) { return false; }
-        if (blk_used_of(blk_alloc(nb).raw.load(std::memory_order_relaxed)) != 0) {
+        if (blk_used_of(blk_alloc(nb).raw.load(std::memory_order_acquire)) != 0) {
             h->num_blocks.store(nb + 1, std::memory_order_release);
             return true;
         }
@@ -562,11 +594,11 @@ struct XCache::Impl {
             if (new_fd >= 0) { idx_fd_ = new_fd; }
         }
 
-        pause_flag_.store(false, std::memory_order_release);
-
         munmap(old_map, old_isz);
         ::close(old_fd);
         ::rename(tmp.c_str(), idx_path_.c_str());
+
+        pause_flag_.store(false, std::memory_order_release);
         last_generation_ = nh->generation.load(std::memory_order_relaxed);
         return true;
     }
@@ -671,7 +703,13 @@ struct XCache::Impl {
     }
 
     void close_file() {
-        if (!idx_map_ || idx_map_ == MAP_FAILED) { return; }
+        if (!idx_map_ || idx_map_ == MAP_FAILED) {
+            if (idx_fd_ >= 0) { ::close(idx_fd_); idx_fd_ = -1; }
+            if (dat_fd_ >= 0) { ::close(dat_fd_); dat_fd_ = -1; }
+            idx_map_ = nullptr;
+            num_blks_ = 0;
+            return;
+        }
         for (size_t i = 0; i < num_blks_; ++i) {
             if (blk_maps_[i] && blk_maps_[i] != MAP_FAILED) {
                 auto raw = blk_alloc(i).raw.load(std::memory_order_relaxed);
@@ -714,7 +752,7 @@ XCache& XCache::operator=(XCache&& o) noexcept {
 xcache_error_t XCache::put_string(const std::string& key, const std::string& value,
                         uint32_t expire_seconds) {
     return impl_->put_typed(key, XCACHE_TEXT, value.data(),
-                            static_cast<uint32_t>(value.size()), expire_seconds);
+                            value.size(), expire_seconds);
 }
 
 xcache_error_t XCache::put_i64(const std::string& key, int64_t value,
@@ -740,22 +778,22 @@ xcache_error_t XCache::put_bool(const std::string& key, bool value,
 xcache_error_t XCache::put_blob(const std::string& key, const void* data, size_t len,
                       uint32_t expire_seconds) {
     return impl_->put_typed(key, XCACHE_BLOB, data,
-                            static_cast<uint32_t>(len), expire_seconds);
+                            len, expire_seconds);
 }
 xcache_error_t XCache::put_vector(const std::string& key, const void* data, size_t len,
                         uint32_t expire_seconds) {
     return impl_->put_typed(key, XCACHE_VECTOR, data,
-                            static_cast<uint32_t>(len), expire_seconds);
+                            len, expire_seconds);
 }
 xcache_error_t XCache::put_set(const std::string& key, const void* data, size_t len,
-                     uint32_t expire_seconds) {
+                      uint32_t expire_seconds) {
     return impl_->put_typed(key, XCACHE_SET, data,
-                            static_cast<uint32_t>(len), expire_seconds);
+                            len, expire_seconds);
 }
 xcache_error_t XCache::put_map(const std::string& key, const void* data, size_t len,
-                     uint32_t expire_seconds) {
+                      uint32_t expire_seconds) {
     return impl_->put_typed(key, XCACHE_MAP, data,
-                            static_cast<uint32_t>(len), expire_seconds);
+                            len, expire_seconds);
 }
 
 // ── get / typed get ──────────────────────────────────────────────
@@ -957,7 +995,7 @@ xcache_error_t XCache::rebuild() {
                 if (I.is_expired(bid, off)) { continue; }
                 auto rec = I.read_record(bid, off);
                 if (tmp.put_typed(rec.key, rec.type, rec.raw_val.data(),
-                                   static_cast<uint32_t>(rec.raw_val.size())) != XCACHE_OK) {
+                                   rec.raw_val.size()) != XCACHE_OK) {
                     ok = false;
                     break;
                 }

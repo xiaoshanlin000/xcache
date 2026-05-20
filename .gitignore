@@ -42,3 +42,7 @@ compile_commands.json
 *.log
 *.bak
 *.orig
+
+.omo/
+**/AGENTS.md
+.cache/

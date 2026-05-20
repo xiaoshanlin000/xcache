@@ -39,11 +39,11 @@ add_library(xcache
 target_include_directories(xcache PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
-target_include_directories(xcache SYSTEM PUBLIC
+target_include_directories(xcache SYSTEM PRIVATE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/xxhash>
 )
 target_compile_features(xcache PUBLIC cxx_std_17)
-target_link_libraries(xcache PUBLIC Threads::Threads)
+target_link_libraries(xcache PRIVATE Threads::Threads)
 
 if(XCACHE_BUILD_TESTS)
     enable_testing()
