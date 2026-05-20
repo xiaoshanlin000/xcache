@@ -133,7 +133,7 @@ Call `sync()` after writes for stronger durability. Destructor auto-syncs, so ma
 | Repeated `remove()` returns `XCACHE_NOT_FOUND` | not idempotent |
 | No CRC | write ordering (data before index) guarantees integrity |
 | TTL precision | expire_seconds in seconds, minimum 1 second, 0 = no expiry |
-| Max key/value size | 4GB each (32-bit length field) |
+| Max key/value size | key 4GB (32-bit length field), value 4GB (uint32_t field cap) |
 | Max DB size | 1TB per block (40-bit offset), 256 blocks max, total 256TB |
 
 ## Build

@@ -133,7 +133,7 @@ xcache 的持久化策略围绕一个核心权衡：**要速度就不能每次�
 | 重复 `remove()` 返回 `XCACHE_NOT_FOUND` | 非幂等操作，删除已删除或已过期的 key 返回 `XCACHE_NOT_FOUND` |
 | 无 CRC 校验 | 写顺序（data before index）保证数据完整性，不额外校验 |
 | TTL 精度 | expire_seconds 单位为秒，最小 1 秒，0=永不过期 |
-| 单 key 上限 | key 最大 4GB（4 字节长度字段），value 最大 4GB |
+| 单 key 上限 | key 最大 4GB（4 字节长度字段），value 最大 4GB（uint32_t 字段上限） |
 | 总容量上限 | 单个 block 最大 1TB（40 位偏移），最多 256 个 block，总计 256TB |
 
 ## 构建
