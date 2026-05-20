@@ -293,7 +293,10 @@ struct XCache::Impl {
         if (off + 4 > bsz) { return {std::string{}, XCACHE_TEXT, std::string{}, true}; }
         uint32_t ksz;
         std::memcpy(&ksz, p0, 4);
-        auto kp = (ksz + 3) & ~3u;
+        auto kp = static_cast<size_t>((ksz + 3) & ~3u);
+        if (kp < ksz) {
+            return {std::string{}, XCACHE_TEXT, std::string{}, true};
+        }
         if (off + 4 + kp + 4 + 4 + 8 > bsz) {
             return {std::string{}, XCACHE_TEXT, std::string{}, true};
         }
@@ -302,6 +305,9 @@ struct XCache::Impl {
         auto p = p0 + 4 + kp;
         uint32_t vt; std::memcpy(&vt, p, 4); p += 4;
         uint32_t vsz; std::memcpy(&vsz, p, 4); p += 4;
+        if (off + 4 + kp + 4 + 4 + 8 + static_cast<size_t>(vsz) > bsz) {
+            return {std::string{}, XCACHE_TEXT, std::string{}, true};
+        }
         uint64_t expire_at; std::memcpy(&expire_at, p, 8); p += 8;
         if (expire_at != 0 && static_cast<uint64_t>(std::time(nullptr)) > expire_at) {
             return {std::move(key), static_cast<xcache_value_type_t>(vt), std::string{}, true};
@@ -319,7 +325,8 @@ struct XCache::Impl {
         if (off + 4 > bsz) { return {}; }
         uint32_t ksz;
         std::memcpy(&ksz, p0, 4);
-        auto kp = (ksz + 3) & ~3u;
+        auto kp = static_cast<size_t>((ksz + 3) & ~3u);
+        if (kp < ksz) { return {}; }
         if (off + 4 + kp + 4 + 4 + 8 > bsz) { return {}; }
         return std::string(p0 + 4, ksz);
     }
@@ -332,7 +339,8 @@ struct XCache::Impl {
         auto p0 = static_cast<const char*>(blk_maps_[bid]) + off;
         if (off + 4 > bsz) { return true; }
         uint32_t ksz; std::memcpy(&ksz, p0, 4);
-        auto kp = (ksz + 3) & ~3u;
+        auto kp = static_cast<size_t>((ksz + 3) & ~3u);
+        if (kp < ksz) { return true; }
         if (off + 4 + kp + 4 + 4 + 8 > bsz) { return true; }
         auto p = p0 + 4 + kp + 4 + 4;
         uint64_t expire_at; std::memcpy(&expire_at, p, 8);
@@ -348,7 +356,8 @@ struct XCache::Impl {
         if (off + 4 > bsz) { return {{}, XCACHE_TEXT}; }
         uint32_t ksz;
         std::memcpy(&ksz, p0, 4);
-        auto kp = (ksz + 3) & ~3u;
+        auto kp = static_cast<size_t>((ksz + 3) & ~3u);
+        if (kp < ksz) { return {{}, XCACHE_TEXT}; }
         if (off + 4 + kp + 4 + 4 + 8 > bsz) { return {{}, XCACHE_TEXT}; }
         std::string key(p0 + 4, ksz);
         auto p = p0 + 4 + kp;
@@ -394,7 +403,7 @@ struct XCache::Impl {
                               size_t size,
                               uint32_t expire_seconds = 0) {
         if (!idx_map_) { return XCACHE_IO_ERROR; }
-        if (size > (1UL << 30)) { return XCACHE_INVALID_ARG; }
+        if (size > UINT32_MAX) { return XCACHE_INVALID_ARG; }
         enter_write();
         auto expire_at = expire_seconds ? static_cast<uint64_t>(std::time(nullptr)) + expire_seconds : 0ULL;
         auto tot = packed_size(key, size);
@@ -592,11 +601,17 @@ struct XCache::Impl {
         if (multi_process_) {
             int new_fd = ::open(tmp.c_str(), O_RDWR);
             if (new_fd >= 0) { idx_fd_ = new_fd; }
+            else { idx_fd_ = -1; }
         }
 
         munmap(old_map, old_isz);
         ::close(old_fd);
-        ::rename(tmp.c_str(), idx_path_.c_str());
+        if (!multi_process_) { idx_fd_ = -1; }
+
+        if (::rename(tmp.c_str(), idx_path_.c_str()) != 0) {
+            pause_flag_.store(false, std::memory_order_release);
+            return false;
+        }
 
         pause_flag_.store(false, std::memory_order_release);
         last_generation_ = nh->generation.load(std::memory_order_relaxed);
@@ -971,6 +986,7 @@ xcache_error_t XCache::rebuild() {
     auto& I = *impl_;
     if (!I.idx_map_) { return XCACHE_IO_ERROR; }
 
+    std::lock_guard<std::mutex> lk(I.rehash_mtx_);
     I.pause_flag_.store(true, std::memory_order_release);
     while (I.active_ops_.load(std::memory_order_acquire) > 0) {
         std::this_thread::yield();
@@ -1026,8 +1042,16 @@ xcache_error_t XCache::rebuild() {
     }
 
     // rename first — old inode stays alive via I's existing fd+mmap
-    ::rename((tmp_path + ".idx").c_str(), I.idx_path_.c_str());
-    ::rename((tmp_path + ".dat").c_str(), I.dat_path_.c_str());
+    if (::rename((tmp_path + ".idx").c_str(), I.idx_path_.c_str()) != 0) {
+        ::unlink((tmp_path + ".dat").c_str());
+        I.pause_flag_.store(false, std::memory_order_release);
+        return XCACHE_IO_ERROR;
+    }
+    if (::rename((tmp_path + ".dat").c_str(), I.dat_path_.c_str()) != 0) {
+        ::rename(I.idx_path_.c_str(), (tmp_path + ".idx").c_str());
+        I.pause_flag_.store(false, std::memory_order_release);
+        return XCACHE_IO_ERROR;
+    }
 
     I.open_file(I.base_path_, blk_sz, multi);
 
