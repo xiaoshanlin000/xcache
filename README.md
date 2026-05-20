@@ -224,6 +224,7 @@ xcache_error_t xcache_put_i64_ex|i32_ex|...(kv, ..., expire_seconds);
 xcache_error_t xcache_get_string(kv, key, char** out);
 xcache_error_t xcache_get_i64(kv, key, int64_t* out);
 xcache_error_t xcache_get_i32(kv, key, int32_t* out);
+xcache_error_t xcache_get_f32(kv, key, float* out);
 xcache_error_t xcache_get_f64(kv, key, double* out);
 xcache_error_t xcache_get_bool(kv, key, int* out);
 xcache_error_t xcache_get_blob|vector|set|map(kv, key, xcache_blob_t* out);  // out->data 需 xcache_free_blob
