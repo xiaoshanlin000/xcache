@@ -176,7 +176,7 @@ xcache_error_t xcache_put_bool_ex(xcache_t* kv, const char* key, int value, uint
 }
 
 xcache_error_t xcache_put_blob(xcache_t* kv, const char* key, const void* data, size_t len) {
-    if (!kv || !key || !data) { return XCACHE_INVALID_ARG; }
+    if (!kv || !key || (len > 0 && !data)) { return XCACHE_INVALID_ARG; }
     try {
         return reinterpret_cast<xcache::XCache*>(kv)->put_blob(key, data, len);
     } catch (...) {
@@ -185,7 +185,7 @@ xcache_error_t xcache_put_blob(xcache_t* kv, const char* key, const void* data, 
 }
 
 xcache_error_t xcache_put_blob_ex(xcache_t* kv, const char* key, const void* data, size_t len, uint32_t expire_seconds) {
-    if (!kv || !key || !data) { return XCACHE_INVALID_ARG; }
+    if (!kv || !key || (len > 0 && !data)) { return XCACHE_INVALID_ARG; }
     try {
         return reinterpret_cast<xcache::XCache*>(kv)->put_blob(key, data, len, expire_seconds);
     } catch (...) {
@@ -194,7 +194,7 @@ xcache_error_t xcache_put_blob_ex(xcache_t* kv, const char* key, const void* dat
 }
 
 xcache_error_t xcache_put_vector(xcache_t* kv, const char* key, const void* data, size_t len) {
-    if (!kv || !key || !data) { return XCACHE_INVALID_ARG; }
+    if (!kv || !key || (len > 0 && !data)) { return XCACHE_INVALID_ARG; }
     try {
         return reinterpret_cast<xcache::XCache*>(kv)->put_vector(key, data, len);
     } catch (...) {
@@ -203,7 +203,7 @@ xcache_error_t xcache_put_vector(xcache_t* kv, const char* key, const void* data
 }
 
 xcache_error_t xcache_put_vector_ex(xcache_t* kv, const char* key, const void* data, size_t len, uint32_t expire_seconds) {
-    if (!kv || !key || !data) { return XCACHE_INVALID_ARG; }
+    if (!kv || !key || (len > 0 && !data)) { return XCACHE_INVALID_ARG; }
     try {
         return reinterpret_cast<xcache::XCache*>(kv)->put_vector(key, data, len, expire_seconds);
     } catch (...) {
@@ -212,7 +212,7 @@ xcache_error_t xcache_put_vector_ex(xcache_t* kv, const char* key, const void* d
 }
 
 xcache_error_t xcache_put_set(xcache_t* kv, const char* key, const void* data, size_t len) {
-    if (!kv || !key || !data) { return XCACHE_INVALID_ARG; }
+    if (!kv || !key || (len > 0 && !data)) { return XCACHE_INVALID_ARG; }
     try {
         return reinterpret_cast<xcache::XCache*>(kv)->put_set(key, data, len);
     } catch (...) {
@@ -221,7 +221,7 @@ xcache_error_t xcache_put_set(xcache_t* kv, const char* key, const void* data, s
 }
 
 xcache_error_t xcache_put_set_ex(xcache_t* kv, const char* key, const void* data, size_t len, uint32_t expire_seconds) {
-    if (!kv || !key || !data) { return XCACHE_INVALID_ARG; }
+    if (!kv || !key || (len > 0 && !data)) { return XCACHE_INVALID_ARG; }
     try {
         return reinterpret_cast<xcache::XCache*>(kv)->put_set(key, data, len, expire_seconds);
     } catch (...) {
@@ -230,7 +230,7 @@ xcache_error_t xcache_put_set_ex(xcache_t* kv, const char* key, const void* data
 }
 
 xcache_error_t xcache_put_map(xcache_t* kv, const char* key, const void* data, size_t len) {
-    if (!kv || !key || !data) { return XCACHE_INVALID_ARG; }
+    if (!kv || !key || (len > 0 && !data)) { return XCACHE_INVALID_ARG; }
     try {
         return reinterpret_cast<xcache::XCache*>(kv)->put_map(key, data, len);
     } catch (...) {
@@ -239,7 +239,7 @@ xcache_error_t xcache_put_map(xcache_t* kv, const char* key, const void* data, s
 }
 
 xcache_error_t xcache_put_map_ex(xcache_t* kv, const char* key, const void* data, size_t len, uint32_t expire_seconds) {
-    if (!kv || !key || !data) { return XCACHE_INVALID_ARG; }
+    if (!kv || !key || (len > 0 && !data)) { return XCACHE_INVALID_ARG; }
     try {
         return reinterpret_cast<xcache::XCache*>(kv)->put_map(key, data, len, expire_seconds);
     } catch (...) {
