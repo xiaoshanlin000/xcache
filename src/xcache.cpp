@@ -402,7 +402,14 @@ struct XCache::Impl {
             if (k != key) { continue; }
             if (vt != expected) { exit_read(); return XCACHE_TYPE_MISMATCH; }
             auto rec = read_record(bid, off);
-            if (rec.expired) { exit_read(); return XCACHE_EXPIRED; }
+            if (rec.expired) {
+                // Lazy expiry: CAS slot to kTomb so future probes skip it.
+                // Best-effort — CAS failure means another thread already handled it.
+                s.state.compare_exchange_strong(v, kTomb,
+                    std::memory_order_acq_rel, std::memory_order_relaxed);
+                exit_read();
+                return XCACHE_EXPIRED;
+            }
             *out = T(parse(std::move(rec)));
             exit_read();
             return XCACHE_OK;
@@ -927,7 +934,13 @@ xcache_error_t XCache::get_type(const std::string& key, xcache_value_type_t* out
         decode_slot(v, bid, off);
         auto [k, vt] = I.read_key_type(bid, off);
         if (k == key) {
-            if (I.is_expired(bid, off)) { I.exit_read(); return XCACHE_EXPIRED; }
+            if (I.is_expired(bid, off)) {
+                // Lazy expiry: CAS slot to kTomb so future probes skip it.
+                s.state.compare_exchange_strong(v, kTomb,
+                    std::memory_order_acq_rel, std::memory_order_relaxed);
+                I.exit_read();
+                return XCACHE_EXPIRED;
+            }
             *out = vt;
             I.exit_read();
             return XCACHE_OK;
@@ -953,7 +966,16 @@ bool XCache::exists(const std::string& key) const {
         if (v == kTomb) { continue; }
         uint64_t bid, off;
         decode_slot(v, bid, off);
-        if (I.read_key(bid, off) == key) { found = !I.is_expired(bid, off); break; }
+        if (I.read_key(bid, off) == key) {
+            if (I.is_expired(bid, off)) {
+                // Lazy expiry: CAS slot to kTomb so future probes skip it.
+                s.state.compare_exchange_strong(v, kTomb,
+                    std::memory_order_acq_rel, std::memory_order_relaxed);
+                break;
+            }
+            found = true;
+            break;
+        }
     }
     I.exit_read();
     return found;
