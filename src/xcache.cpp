@@ -100,12 +100,19 @@ static constexpr double   kLoadMax   = 0.70;
 static constexpr uint64_t kEmpty     = 0;
 static constexpr uint64_t kTomb      = 1;
 
+// Slot encoding: [tag bit(1) | bid(24) | off(40)].
+// tag=1 means valid, kEmpty=0 and kTomb=1 are the two
+// sentinels (they wouldn't have the low bit set).
+// bid=block index (0-255), off=byte offset within block (up to 1TB).
 static uint64_t encode_slot(uint64_t bid, uint64_t off) {
     return ((bid << 40) | off) << 1 | 1;
 }
 static void decode_slot(uint64_t s, uint64_t& bid, uint64_t& off) {
     auto v = s >> 1; bid = v >> 40; off = v & 0xFFFFFFFFFF;
 }
+
+// BlkAlloc::raw encoding: hi32 = block allocated size, lo32 = used bytes.
+// Both are 32-bit values, so each block is limited to 4GB tracked usage.
 static uint64_t blk_sz_of(uint64_t r)  { return r >> 32; }
 static uint64_t blk_used_of(uint64_t r) { return r & 0xFFFFFFFF; }
 static uint64_t blk_encode_r(uint64_t sz, uint64_t used) {
@@ -206,6 +213,8 @@ struct XCache::Impl {
             xc_lock_ex(idx_fd_);
         }
         active_ops_.fetch_add(1, std::memory_order_acquire);
+        // If rehash/rebuild is in progress, drop active_ops_ and spin
+        // so they can see active_ops_ reach 0 and drain us.
         if (pause_flag_.load(std::memory_order_acquire)) {
             active_ops_.fetch_sub(1, std::memory_order_release);
             while (pause_flag_.load(std::memory_order_acquire)) {
@@ -236,7 +245,7 @@ struct XCache::Impl {
         struct stat st;
         if (::fstat(idx_fd_, &st) != 0) { return; }
 
-        int new_fd = ::open(idx_path_.c_str(), O_RDWR);
+        int new_fd = ::open(idx_path_.c_str(), O_RDWR | O_CLOEXEC | O_NOFOLLOW);
         if (new_fd < 0) { return; }
 
         void* new_map = mmap(nullptr, static_cast<size_t>(st.st_size),
@@ -250,7 +259,7 @@ struct XCache::Impl {
 
         idx_map_ = new_map;
         idx_fd_  = new_fd;
-        const_cast<Impl*>(this)->last_generation_ = gen;
+        last_generation_ = gen;
 
         munmap(old_map, old_sz);
         ::close(old_fd);
@@ -264,6 +273,9 @@ struct XCache::Impl {
         return (4 + kp + 4 + 4 + 8 + val_size + 7) & ~7ull;
     }
 
+    // Record format (serialized, 8-byte aligned):
+    //   [ksz(4) | key(kp padded) | vt(4) | vsz(4) | expire_at(8) | val(vsz)]
+    //   kp = ceil4(ksz), total = (4 + kp + 4 + 4 + 8 + vsz + 7) & ~7
     void write_record(uint64_t bid, uint64_t off,
                       const std::string& key, xcache_value_type_t type,
                       const void* data, size_t size,
@@ -304,6 +316,7 @@ struct XCache::Impl {
 
         auto p = p0 + 4 + kp;
         uint32_t vt; std::memcpy(&vt, p, 4); p += 4;
+        if (vt > XCACHE_MAP) { return {std::string{}, XCACHE_TEXT, std::string{}, true}; }
         uint32_t vsz; std::memcpy(&vsz, p, 4); p += 4;
         if (off + 4 + kp + 4 + 4 + 8 + static_cast<size_t>(vsz) > bsz) {
             return {std::string{}, XCACHE_TEXT, std::string{}, true};
@@ -362,6 +375,7 @@ struct XCache::Impl {
         std::string key(p0 + 4, ksz);
         auto p = p0 + 4 + kp;
         uint32_t vt; std::memcpy(&vt, p, 4);
+        if (vt > XCACHE_MAP) { return {{}, XCACHE_TEXT}; }
         return {std::move(key), static_cast<xcache_value_type_t>(vt)};
     }
 
@@ -404,6 +418,7 @@ struct XCache::Impl {
                               uint32_t expire_seconds = 0) {
         if (!idx_map_) { return XCACHE_IO_ERROR; }
         if (size > UINT32_MAX) { return XCACHE_INVALID_ARG; }
+        if (size > 0 && !data) { return XCACHE_INVALID_ARG; }
         enter_write();
         auto expire_at = expire_seconds ? static_cast<uint64_t>(std::time(nullptr)) + expire_seconds : 0ULL;
         auto tot = packed_size(key, size);
@@ -448,6 +463,8 @@ struct XCache::Impl {
                     }
                     return true;
                 }
+                // CAS failed — another thread modified this slot.
+                // Retry from the same probe position (--i cancels ++i).
                 --i;
                 continue;
             }
@@ -543,7 +560,7 @@ struct XCache::Impl {
         auto is2 = align8(ba2 + kMaxBlks * sizeof(BlkAlloc));
 
         auto tmp = idx_path_ + ".tmp";
-        int fd = ::open(tmp.c_str(), O_RDWR | O_CREAT, 0644);
+        int fd = ::open(tmp.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0644);
         if (fd < 0) { pause_flag_.store(false); return false; }
         if (::ftruncate(fd, static_cast<off_t>(is2)) != 0) {
             ::close(fd); ::unlink(tmp.c_str()); pause_flag_.store(false); return false;
@@ -627,9 +644,9 @@ struct XCache::Impl {
         dat_path_  = path + ".dat";
         ::unlink((idx_path_ + ".tmp").c_str());
 
-        idx_fd_ = ::open(idx_path_.c_str(), O_RDWR | O_CREAT, 0644);
+        idx_fd_ = ::open(idx_path_.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0644);
         if (idx_fd_ < 0) { return; }
-        dat_fd_ = ::open(dat_path_.c_str(), O_RDWR | O_CREAT, 0644);
+        dat_fd_ = ::open(dat_path_.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0644);
         if (dat_fd_ < 0) { ::close(idx_fd_); idx_fd_ = -1; return; }
 
         struct stat st;
@@ -823,35 +840,43 @@ xcache_error_t XCache::get_string(const std::string& key, std::string* out) cons
 xcache_error_t XCache::get_i64(const std::string& key, int64_t* out) const {
     return impl_->key_get_typed(
         key, XCACHE_INT64, [](const Record& r) -> int64_t {
-            int64_t v; std::memcpy(&v, r.raw_val.data(), sizeof(v)); return v;
+            int64_t v = 0;
+            if (r.raw_val.size() >= sizeof(v)) { std::memcpy(&v, r.raw_val.data(), sizeof(v)); }
+            return v;
         }, out);
 }
 
 xcache_error_t XCache::get_i32(const std::string& key, int32_t* out) const {
     return impl_->key_get_typed(
         key, XCACHE_INT32, [](const Record& r) -> int32_t {
-            int32_t v; std::memcpy(&v, r.raw_val.data(), sizeof(v)); return v;
+            int32_t v = 0;
+            if (r.raw_val.size() >= sizeof(v)) { std::memcpy(&v, r.raw_val.data(), sizeof(v)); }
+            return v;
         }, out);
 }
 
 xcache_error_t XCache::get_f32(const std::string& key, float* out) const {
     return impl_->key_get_typed(
         key, XCACHE_FLOAT, [](const Record& r) -> float {
-            float v; std::memcpy(&v, r.raw_val.data(), sizeof(v)); return v;
+            float v = 0;
+            if (r.raw_val.size() >= sizeof(v)) { std::memcpy(&v, r.raw_val.data(), sizeof(v)); }
+            return v;
         }, out);
 }
 
 xcache_error_t XCache::get_f64(const std::string& key, double* out) const {
     return impl_->key_get_typed(
         key, XCACHE_DOUBLE, [](const Record& r) -> double {
-            double v; std::memcpy(&v, r.raw_val.data(), sizeof(v)); return v;
+            double v = 0;
+            if (r.raw_val.size() >= sizeof(v)) { std::memcpy(&v, r.raw_val.data(), sizeof(v)); }
+            return v;
         }, out);
 }
 
 xcache_error_t XCache::get_bool(const std::string& key, bool* out) const {
     return impl_->key_get_typed(
         key, XCACHE_BOOLEAN, [](const Record& r) -> bool {
-            return r.raw_val[0] != 0;
+            return r.raw_val.size() > 0 && r.raw_val[0] != 0;
         }, out);
 }
 
@@ -983,6 +1008,18 @@ void XCache::close() {
 }
 
 xcache_error_t XCache::rebuild() {
+    //
+    // Compacts the .dat file: copies all live entries into a fresh
+    // pair of (.idx, .dat) files, then atomically swaps them in.
+    // Reads are never blocked; writes are paused only during the swap.
+    //
+    //  1. Pause writers, wait for all in-flight ops to drain
+    //  2. Build a temp Impl with fresh .rebuild.idx + .rebuild.dat
+    //     — copy every non-expired entry from the current index into tmp
+    //  3. Swap: rename temp files onto real paths, open them as new I
+    //  4. Drain any readers still using old pointer, then free old resources
+    //  5. Unpause writers
+    //
     auto& I = *impl_;
     if (!I.idx_map_) { return XCACHE_IO_ERROR; }
 
@@ -995,6 +1032,7 @@ xcache_error_t XCache::rebuild() {
     auto blk_sz = I.hdr()->default_block_size;
     auto multi  = I.multi_process_;
 
+    // ── step 2: build temp copy ────────────────────────────────────
     auto tmp_path = I.base_path_ + ".rebuild";
     bool ok = false;
     {
@@ -1020,6 +1058,7 @@ xcache_error_t XCache::rebuild() {
         tmp.close_file();
     }
 
+    // copy failed — discard temp files, resume writers, done
     if (!ok) {
         ::unlink((tmp_path + ".idx").c_str());
         ::unlink((tmp_path + ".dat").c_str());
@@ -1027,7 +1066,8 @@ xcache_error_t XCache::rebuild() {
         return XCACHE_NO_SPACE;
     }
 
-    // save old state before swap (same style as rehash)
+    // ── step 3: atomic swap ────────────────────────────────────────
+    // save old I's state (inodes stay alive via saved fds/mmaps)
     auto* old_idx_map   = I.idx_map_;
     auto  old_idx_fd    = I.idx_fd_;
     auto  old_dat_fd    = I.dat_fd_;
@@ -1041,7 +1081,9 @@ xcache_error_t XCache::rebuild() {
             I.blk_alloc(i).raw.load(std::memory_order_relaxed));
     }
 
-    // rename first — old inode stays alive via I's existing fd+mmap
+    // rename .rebuild files onto real paths
+    // failure: temp .dat is unlinked; old files (still open via
+    // saved fds/mmaps) remain the current active state.
     if (::rename((tmp_path + ".idx").c_str(), I.idx_path_.c_str()) != 0) {
         ::unlink((tmp_path + ".dat").c_str());
         I.pause_flag_.store(false, std::memory_order_release);
@@ -1053,14 +1095,23 @@ xcache_error_t XCache::rebuild() {
         return XCACHE_IO_ERROR;
     }
 
+    // open the now-replaced files as the new I
+    // failure: rename the rebuild files back to .rebuild paths so
+    // they can be inspected or retried; old I state was never
+    // destroyed — the caller can continue using the cache normally.
     I.open_file(I.base_path_, blk_sz, multi);
+    if (!I.idx_map_ || I.idx_map_ == MAP_FAILED) {
+        ::rename(I.idx_path_.c_str(), (tmp_path + ".idx").c_str());
+        ::rename(I.dat_path_.c_str(), (tmp_path + ".dat").c_str());
+        I.pause_flag_.store(false, std::memory_order_release);
+        return XCACHE_IO_ERROR;
+    }
 
-    // drain readers that may still hold old pointer
+    // ── step 4: drain readers, release old resources ───────────────
     while (I.active_ops_.load(std::memory_order_acquire) > 0) {
         std::this_thread::yield();
     }
 
-    // cleanup old — same style as rehash
     for (size_t i = 0; i < old_num_blks; ++i) {
         if (old_blk_maps[i] && old_blk_maps[i] != MAP_FAILED) {
             ::munmap(old_blk_maps[i], old_blk_szs[i]);
@@ -1072,6 +1123,7 @@ xcache_error_t XCache::rebuild() {
     if (old_idx_fd >= 0)  { ::close(old_idx_fd); }
     if (old_dat_fd >= 0)  { ::close(old_dat_fd); }
 
+    // ── step 5: done ───────────────────────────────────────────────
     I.pause_flag_.store(false, std::memory_order_release);
     return XCACHE_OK;
 }
