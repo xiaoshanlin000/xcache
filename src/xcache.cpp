@@ -102,7 +102,7 @@ static constexpr uint64_t kTomb      = 1;
 
 // Slot layout (64 bits): [ bid(24) | off(40) | tag(1) ]
 // tag=1 → valid slot; kEmpty(0) and kTomb(1) have tag=0 (sentinels).
-// bid: block index (0–255, kMaxBlks)
+// bid: block index (≤kMaxBlks=256, encoding allows up to 24 bits)
 // off: byte offset within block (up to 1 TB)
 static uint64_t encode_slot(uint64_t bid, uint64_t off) {
     return ((bid << 40) | off) << 1 | 1;
@@ -255,7 +255,7 @@ struct XCache::Impl {
 
         idx_map_ = new_map;
         idx_fd_  = new_fd;
-        const_cast<Impl*>(this)->last_generation_ = gen;
+        last_generation_ = gen;
 
         munmap(old_map, old_sz);
         ::close(old_fd);
@@ -467,9 +467,7 @@ struct XCache::Impl {
                 if (s.state.compare_exchange_strong(
                         exp, dv, std::memory_order_acq_rel,
                         std::memory_order_relaxed)) {
-                    if (v == kEmpty || v == kTomb) {
-                        hd->num_entries.fetch_add(1, std::memory_order_relaxed);
-                    }
+                    hd->num_entries.fetch_add(1, std::memory_order_relaxed);
                     return true;
                 }
                 continue;
@@ -726,6 +724,7 @@ struct XCache::Impl {
             uint64_t bid, off;
             decode_slot(v, bid, off);
             auto [k, vt] = read_key_type(bid, off);
+            (void)vt;
             if (is_expired_at(bid, off, static_cast<uint32_t>(k.size()))) { continue; }
             keys.push_back(std::move(k));
         }
