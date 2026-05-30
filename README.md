@@ -91,6 +91,14 @@ put:  serialize → alloc(.dat 尾部) → memcpy → CAS 改 .idx slot
 | rehash | 暂停写 → 新建 `.idx.tmp` → 重插所有 entry → 原子切换 → 恢复写（读全程不阻塞） |
 | rebuild | 暂停写 → 新建 `.idx+.dat.tmp` → 拷贝有效 entry → rename 替换 → 恢复写（读全程不阻塞） |
 
+### 懒过期（Lazy Expiry）
+
+`get` / `exists` / `get_type` 读到过期 key 时，**自动 CAS 将 slot 标记为墓碑**（不再是只读操作）。后续对该 key 的任何操作都会看到它已被删除。
+
+- `scan()` / `get_all_keys()` **不触发**懒过期——它们跳过过期 key 但不修改索引
+- CAS 失败（其他线程先删了）无害，下次操作自然会跳过
+- rebuild 期间不受影响——rebuild 已经过滤了过期 key
+
 ### 并发模型
 
 | 场景 | 机制 |
@@ -128,12 +136,12 @@ xcache 的持久化策略围绕一个核心权衡：**要速度就不能每次�
 | 行为 | 说明 |
 |------|------|
 | 类型严格匹配 | `put_i64` 写入的数据只能用 `get_i64` 读取，`get_string()` 返回 `XCACHE_TYPE_MISMATCH` |
-| `size()` 不精确 | 不检查 TTL，可能包含已过期但未 rebuild 的 key |
+| `size()` 不精确 | 不主动扫描过期 key，但读操作会触发懒过期自动清理 |
 | `get_type()` 返回 error code | 成功时 `*out` 包含类型；`XCACHE_NOT_FOUND` / `XCACHE_EXPIRED` 表示不存在或已过期 |
-| 重复 `remove()` 返回 `XCACHE_NOT_FOUND` | 非幂等操作，删除已删除或已过期的 key 返回 `XCACHE_NOT_FOUND` |
+| 重复 `remove()` 返回 `XCACHE_NOT_FOUND` | 非幂等操作；若 key 已被懒过期清理，也返回 `XCACHE_NOT_FOUND` |
 | 无 CRC 校验 | 写顺序（data before index）保证数据完整性，不额外校验 |
 | TTL 精度 | expire_seconds 单位为秒，最小 1 秒，0=永不过期 |
-| 单 key 上限 | key 最大 4GB（4 字节长度字段），value 最大 4GB（uint32_t 字段上限） |
+| 单 key 上限 | key 最大 4GB（4 字节长度字段），value 最大 4GB |
 | 总容量上限 | 单个 block 最大 1TB（40 位偏移），最多 256 个 block，总计 256TB |
 
 ## 构建
@@ -224,7 +232,6 @@ xcache_error_t xcache_put_i64_ex|i32_ex|...(kv, ..., expire_seconds);
 xcache_error_t xcache_get_string(kv, key, char** out);
 xcache_error_t xcache_get_i64(kv, key, int64_t* out);
 xcache_error_t xcache_get_i32(kv, key, int32_t* out);
-xcache_error_t xcache_get_f32(kv, key, float* out);
 xcache_error_t xcache_get_f64(kv, key, double* out);
 xcache_error_t xcache_get_bool(kv, key, int* out);
 xcache_error_t xcache_get_blob|vector|set|map(kv, key, xcache_blob_t* out);  // out->data 需 xcache_free_blob

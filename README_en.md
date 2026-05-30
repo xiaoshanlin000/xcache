@@ -91,6 +91,14 @@ Single block max 1TB (40-bit offset), 256 blocks max, total **256TB**.
 | rehash | Pause writes → new `.idx.tmp` → rehash entries → atomic swap → resume (reads never block) |
 | rebuild | Pause writes → new `.idx+.dat.tmp` → copy live entries → rename → resume (reads never block) |
 
+### Lazy Expiry
+
+When `get` / `exists` / `get_type` encounter an expired key, they **automatically CAS the slot to tombstone** (read operations are no longer read-only). Subsequent operations on that key will see it as deleted.
+
+- `scan()` / `get_all_keys()` do **not** trigger lazy expiry — they skip expired keys without modifying the index
+- CAS failure (another thread already removed it) is harmless — the next operation will naturally skip it
+- rebuild is unaffected — it already filters out expired keys
+
 ### Concurrency Model
 
 | Scenario | Mechanism |
@@ -128,12 +136,12 @@ Call `sync()` after writes for stronger durability. Destructor auto-syncs, so ma
 | Behavior | Note |
 |----------|------|
 | Strict type matching | `put_i64` data requires `get_i64`; `get_string()` returns `XCACHE_TYPE_MISMATCH` |
-| `size()` is approximate | doesn't check TTL, may include expired-but-unrebuilt keys |
+| `size()` is approximate | doesn't proactively scan for expiry, but read ops trigger lazy expiry auto-cleanup |
 | `get_type()` returns error code | `*out` contains type on success; `XCACHE_NOT_FOUND` / `XCACHE_EXPIRED` when missing/expired |
-| Repeated `remove()` returns `XCACHE_NOT_FOUND` | not idempotent |
+| Repeated `remove()` returns `XCACHE_NOT_FOUND` | not idempotent; also returns `XCACHE_NOT_FOUND` if key was already cleaned by lazy expiry |
 | No CRC | write ordering (data before index) guarantees integrity |
 | TTL precision | expire_seconds in seconds, minimum 1 second, 0 = no expiry |
-| Max key/value size | key 4GB (32-bit length field), value 4GB (uint32_t field cap) |
+| Max key/value size | 4GB each (32-bit length field) |
 | Max DB size | 1TB per block (40-bit offset), 256 blocks max, total 256TB |
 
 ## Build
@@ -212,7 +220,6 @@ xcache_error_t xcache_put_i64_ex|i32_ex|...(kv, ..., expire_seconds);
 xcache_error_t xcache_get_string(kv, key, char** out);
 xcache_error_t xcache_get_i64(kv, key, int64_t* out);
 xcache_error_t xcache_get_i32(kv, key, int32_t* out);
-xcache_error_t xcache_get_f32(kv, key, float* out);
 xcache_error_t xcache_get_f64(kv, key, double* out);
 xcache_error_t xcache_get_bool(kv, key, int* out);
 xcache_error_t xcache_get_blob|vector|set|map(kv, key, xcache_blob_t* out);  // free out->data with xcache_free_blob

@@ -2,7 +2,6 @@
 #include <gtest/gtest.h>
 #include <chrono>
 #include <cstdlib>
-#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -252,9 +251,8 @@ TEST(XFileConcurrent, ParallelGets) {
 
         for (int t = 0; t < 8; ++t) {
             threads.emplace_back([&kv, &found] {
-                thread_local std::mt19937 rng(std::random_device{}());
                 for (int i = 0; i < 5000; ++i) {
-                    auto k = std::to_string(std::uniform_int_distribution<int>(0, 9999)(rng));
+                    auto k = std::to_string(std::rand() % 10000);
                     std::string v;
                     if (kv.get_string(k, &v) == XCACHE_OK) found.fetch_add(1);
                 }
@@ -276,10 +274,9 @@ TEST(XFileConcurrent, MixedWorkload) {
         std::vector<std::thread> threads;
         for (int t = 0; t < 8; ++t) {
             threads.emplace_back([&kv, &stop, &ops] {
-                thread_local std::mt19937 rng(std::random_device{}());
                 while (!stop.load()) {
-                    auto k = std::to_string(std::uniform_int_distribution<int>(0, 4999)(rng));
-                    switch (std::uniform_int_distribution<int>(0, 3)(rng)) {
+                    auto k = std::to_string(std::rand() % 5000);
+                    switch (std::rand() % 4) {
                         case 0: kv.put_string(k, "v"); break;
                         case 1: { std::string v; kv.get_string(k, &v); }      break;
                         case 2: kv.exists(k);   break;
@@ -706,11 +703,10 @@ TEST(XFileConcurrent, PutRemoveNoCrash) {
         std::vector<std::thread> threads;
         for (int t = 0; t < 8; ++t) {
             threads.emplace_back([&kv, &stop] {
-                thread_local std::mt19937 rng(std::random_device{}());
                 while (!stop.load()) {
-                    auto k = std::to_string(std::uniform_int_distribution<int>(0, 19)(rng));
+                    auto k = std::to_string(std::rand() % 20);
                     kv.put_string(k, "v");
-                    if (std::uniform_int_distribution<int>(0, 1)(rng)) {
+                    if (std::rand() % 2) {
                         kv.remove(k);
                     }
                     kv.size();  // must not crash

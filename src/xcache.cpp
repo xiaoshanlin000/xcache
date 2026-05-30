@@ -100,19 +100,17 @@ static constexpr double   kLoadMax   = 0.70;
 static constexpr uint64_t kEmpty     = 0;
 static constexpr uint64_t kTomb      = 1;
 
-// Slot encoding: [tag bit(1) | bid(24) | off(40)].
-// tag=1 means valid, kEmpty=0 and kTomb=1 are the two
-// sentinels (they wouldn't have the low bit set).
-// bid=block index (0-255), off=byte offset within block (up to 1TB).
+// Slot layout (64 bits): [ bid(24) | off(40) | tag(1) ]
+// tag=1 → valid slot; kEmpty(0) and kTomb(1) have tag=0 (sentinels).
+// bid: block index (0–255, kMaxBlks)
+// off: byte offset within block (up to 1 TB)
 static uint64_t encode_slot(uint64_t bid, uint64_t off) {
     return ((bid << 40) | off) << 1 | 1;
 }
 static void decode_slot(uint64_t s, uint64_t& bid, uint64_t& off) {
     auto v = s >> 1; bid = v >> 40; off = v & 0xFFFFFFFFFF;
 }
-
-// BlkAlloc::raw encoding: hi32 = block allocated size, lo32 = used bytes.
-// Both are 32-bit values, so each block is limited to 4GB tracked usage.
+// BlkAlloc raw layout: [ block_size(32) | used_bytes(32) ]
 static uint64_t blk_sz_of(uint64_t r)  { return r >> 32; }
 static uint64_t blk_used_of(uint64_t r) { return r & 0xFFFFFFFF; }
 static uint64_t blk_encode_r(uint64_t sz, uint64_t used) {
@@ -213,8 +211,6 @@ struct XCache::Impl {
             xc_lock_ex(idx_fd_);
         }
         active_ops_.fetch_add(1, std::memory_order_acquire);
-        // If rehash/rebuild is in progress, drop active_ops_ and spin
-        // so they can see active_ops_ reach 0 and drain us.
         if (pause_flag_.load(std::memory_order_acquire)) {
             active_ops_.fetch_sub(1, std::memory_order_release);
             while (pause_flag_.load(std::memory_order_acquire)) {
@@ -245,7 +241,7 @@ struct XCache::Impl {
         struct stat st;
         if (::fstat(idx_fd_, &st) != 0) { return; }
 
-        int new_fd = ::open(idx_path_.c_str(), O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+        int new_fd = ::open(idx_path_.c_str(), O_RDWR);
         if (new_fd < 0) { return; }
 
         void* new_map = mmap(nullptr, static_cast<size_t>(st.st_size),
@@ -259,7 +255,7 @@ struct XCache::Impl {
 
         idx_map_ = new_map;
         idx_fd_  = new_fd;
-        last_generation_ = gen;
+        const_cast<Impl*>(this)->last_generation_ = gen;
 
         munmap(old_map, old_sz);
         ::close(old_fd);
@@ -267,60 +263,43 @@ struct XCache::Impl {
 
     // ── pack / read / write ────────────────────────────────────────
 
-    static size_t packed_size(const std::string& key, size_t val_size) {
-        size_t ksz = key.size();
-        size_t kp  = (ksz + 3) & ~3ull;
-        return (4 + kp + 4 + 4 + 8 + val_size + 7) & ~7ull;
+    // On-disk record layout (all fields naturally aligned after padding):
+    //   [ ksz(4) | key(ksz) | pad→4B | type(4) | vsz(4) | expire_at(8) | value(vsz) ]
+    // ksz = raw key length; vsz = raw value length; expire_at=0 means no TTL.
+    static uint32_t packed_size(const std::string& key, uint32_t val_size) {
+        uint32_t ksz = static_cast<uint32_t>(key.size());
+        uint32_t kp  = (ksz + 3) & ~3u;
+        return (4 + kp + 4 + 4 + 8 + val_size + 7) & ~7u;
     }
 
-    // Record format (serialized, 8-byte aligned):
-    //   [ksz(4) | key(kp padded) | vt(4) | vsz(4) | expire_at(8) | val(vsz)]
-    //   kp = ceil4(ksz), total = (4 + kp + 4 + 4 + 8 + vsz + 7) & ~7
     void write_record(uint64_t bid, uint64_t off,
                       const std::string& key, xcache_value_type_t type,
-                      const void* data, size_t size,
+                      const void* data, uint32_t size,
                       uint64_t expire_at) const {
         auto p = static_cast<char*>(blk_maps_[bid]) + off;
         uint32_t ksz = static_cast<uint32_t>(key.size());
         uint32_t kp  = (ksz + 3) & ~3u;
-        uint32_t vsz = static_cast<uint32_t>(size);
         size_t o = 0;
         std::memcpy(p + o, &ksz, 4); o += 4;
         std::memcpy(p + o, key.data(), ksz); o += kp;  // NOLINT: binary key with explicit size, not a C string
         uint32_t vt = static_cast<uint32_t>(type);
         std::memcpy(p + o, &vt, 4); o += 4;
-        std::memcpy(p + o, &vsz, 4); o += 4;
+        std::memcpy(p + o, &size, 4); o += 4;
         std::memcpy(p + o, &expire_at, 8); o += 8;
         std::memcpy(p + o, data, size);
     }
 
     Record read_record(uint64_t bid, uint64_t off) const {
-        if (bid >= num_blks_) { return {std::string{}, XCACHE_TEXT, std::string{}, true}; }
-        if (!blk_maps_[bid] || blk_maps_[bid] == MAP_FAILED) {
-            return {std::string{}, XCACHE_TEXT, std::string{}, true};
-        }
-        auto raw = blk_alloc(bid).raw.load(std::memory_order_relaxed);
-        auto bsz = blk_sz_of(raw);
         auto p0 = static_cast<const char*>(blk_maps_[bid]) + off;
-        if (off + 4 > bsz) { return {std::string{}, XCACHE_TEXT, std::string{}, true}; }
+
         uint32_t ksz;
         std::memcpy(&ksz, p0, 4);
-        auto kp = static_cast<size_t>((ksz + 3) & ~3u);
-        if (kp < ksz) {
-            return {std::string{}, XCACHE_TEXT, std::string{}, true};
-        }
-        if (off + 4 + kp + 4 + 4 + 8 > bsz) {
-            return {std::string{}, XCACHE_TEXT, std::string{}, true};
-        }
+        auto kp = (ksz + 3) & ~3u;
         std::string key(p0 + 4, ksz);
 
         auto p = p0 + 4 + kp;
         uint32_t vt; std::memcpy(&vt, p, 4); p += 4;
-        if (vt > XCACHE_MAP) { return {std::string{}, XCACHE_TEXT, std::string{}, true}; }
         uint32_t vsz; std::memcpy(&vsz, p, 4); p += 4;
-        if (off + 4 + kp + 4 + 4 + 8 + static_cast<size_t>(vsz) > bsz) {
-            return {std::string{}, XCACHE_TEXT, std::string{}, true};
-        }
         uint64_t expire_at; std::memcpy(&expire_at, p, 8); p += 8;
         if (expire_at != 0 && static_cast<uint64_t>(std::time(nullptr)) > expire_at) {
             return {std::move(key), static_cast<xcache_value_type_t>(vt), std::string{}, true};
@@ -330,53 +309,77 @@ struct XCache::Impl {
     }
 
     std::string read_key(uint64_t bid, uint64_t off) const {
-        if (bid >= num_blks_) { return {}; }
-        if (!blk_maps_[bid] || blk_maps_[bid] == MAP_FAILED) { return {}; }
-        auto raw = blk_alloc(bid).raw.load(std::memory_order_relaxed);
-        auto bsz = blk_sz_of(raw);
         auto p0 = static_cast<const char*>(blk_maps_[bid]) + off;
-        if (off + 4 > bsz) { return {}; }
         uint32_t ksz;
         std::memcpy(&ksz, p0, 4);
-        auto kp = static_cast<size_t>((ksz + 3) & ~3u);
-        if (kp < ksz) { return {}; }
-        if (off + 4 + kp + 4 + 4 + 8 > bsz) { return {}; }
         return std::string(p0 + 4, ksz);
     }
 
     bool is_expired(uint64_t bid, uint64_t off) const {
-        if (bid >= num_blks_) { return true; }
-        if (!blk_maps_[bid] || blk_maps_[bid] == MAP_FAILED) { return true; }
-        auto raw = blk_alloc(bid).raw.load(std::memory_order_relaxed);
-        auto bsz = blk_sz_of(raw);
         auto p0 = static_cast<const char*>(blk_maps_[bid]) + off;
-        if (off + 4 > bsz) { return true; }
         uint32_t ksz; std::memcpy(&ksz, p0, 4);
-        auto kp = static_cast<size_t>((ksz + 3) & ~3u);
-        if (kp < ksz) { return true; }
-        if (off + 4 + kp + 4 + 4 + 8 > bsz) { return true; }
+        auto kp = (ksz + 3) & ~3u;
         auto p = p0 + 4 + kp + 4 + 4;
         uint64_t expire_at; std::memcpy(&expire_at, p, 8);
         return expire_at != 0 && static_cast<uint64_t>(std::time(nullptr)) > expire_at;
     }
 
     std::pair<std::string, xcache_value_type_t> read_key_type(uint64_t bid, uint64_t off) const {
-        if (bid >= num_blks_) { return {{}, XCACHE_TEXT}; }
-        if (!blk_maps_[bid] || blk_maps_[bid] == MAP_FAILED) { return {{}, XCACHE_TEXT}; }
-        auto raw = blk_alloc(bid).raw.load(std::memory_order_relaxed);
-        auto bsz = blk_sz_of(raw);
         auto p0 = static_cast<const char*>(blk_maps_[bid]) + off;
-        if (off + 4 > bsz) { return {{}, XCACHE_TEXT}; }
         uint32_t ksz;
         std::memcpy(&ksz, p0, 4);
-        auto kp = static_cast<size_t>((ksz + 3) & ~3u);
-        if (kp < ksz) { return {{}, XCACHE_TEXT}; }
-        if (off + 4 + kp + 4 + 4 + 8 > bsz) { return {{}, XCACHE_TEXT}; }
+        auto kp = (ksz + 3) & ~3u;
         std::string key(p0 + 4, ksz);
         auto p = p0 + 4 + kp;
         uint32_t vt; std::memcpy(&vt, p, 4);
-        if (vt > XCACHE_MAP) { return {{}, XCACHE_TEXT}; }
         return {std::move(key), static_cast<xcache_value_type_t>(vt)};
+    }
+
+    // ── zero-allocation key access ───────────────────────────────
+
+    bool key_equals(uint64_t bid, uint64_t off, const std::string& key) const {
+        auto p0 = static_cast<const char*>(blk_maps_[bid]) + off;
+        uint32_t ksz;
+        std::memcpy(&ksz, p0, 4);
+        if (ksz != static_cast<uint32_t>(key.size())) { return false; }
+        return std::memcmp(p0 + 4, key.data(), ksz) == 0;
+    }
+
+    bool key_equals_and_type(uint64_t bid, uint64_t off, const std::string& key,
+                             xcache_value_type_t* out_type) const {
+        auto p0 = static_cast<const char*>(blk_maps_[bid]) + off;
+        uint32_t ksz;
+        std::memcpy(&ksz, p0, 4);
+        if (ksz != static_cast<uint32_t>(key.size())) { return false; }
+        if (std::memcmp(p0 + 4, key.data(), ksz) != 0) { return false; }
+        auto kp = (ksz + 3) & ~3u;
+        uint32_t vt;
+        std::memcpy(&vt, p0 + 4 + kp, 4);
+        *out_type = static_cast<xcache_value_type_t>(vt);
+        return true;
+    }
+
+    // Read value + expiry, skipping key and type (already validated).
+    // Returns {raw_val, expired}.
+    std::pair<std::string, bool> read_value(uint64_t bid, uint64_t off,
+                                             uint32_t key_size) const {
+        auto p0 = static_cast<const char*>(blk_maps_[bid]) + off;
+        auto kp = (key_size + 3) & ~3u;
+        auto p = p0 + 4 + kp + 4;  // skip ksz header + padded key + type
+        uint32_t vsz; std::memcpy(&vsz, p, 4); p += 4;
+        uint64_t expire_at; std::memcpy(&expire_at, p, 8); p += 8;
+        if (expire_at != 0 && static_cast<uint64_t>(std::time(nullptr)) > expire_at) {
+            return {std::string{}, true};
+        }
+        return {std::string(p, vsz), false};
+    }
+
+    bool is_expired_at(uint64_t bid, uint64_t off, uint32_t key_size) const {
+        auto p0 = static_cast<const char*>(blk_maps_[bid]) + off;
+        auto kp = (key_size + 3) & ~3u;
+        auto p = p0 + 4 + kp + 4 + 4;  // skip ksz + padded key + type + vsz
+        uint64_t expire_at; std::memcpy(&expire_at, p, 8);
+        return expire_at != 0 && static_cast<uint64_t>(std::time(nullptr)) > expire_at;
     }
 
     // ── typed get helpers ─────────────────────────────────────────
@@ -385,10 +388,10 @@ struct XCache::Impl {
     xcache_error_t key_get_typed(const std::string& key,
                                   xcache_value_type_t expected,
                                   F&& parse,
-                                  decltype(parse(std::declval<Record>()))* out) const {
+                                  decltype(parse(std::declval<std::string>()))* out) const {
         if (!idx_map_) { return XCACHE_IO_ERROR; }
         enter_read();
-        using T = decltype(parse(std::declval<Record>()));
+        using T = decltype(parse(std::declval<std::string>()));
         auto h  = XXH3_64bits(key.data(), key.size());
         auto N  = hdr()->num_slots;
         for (size_t i = 0; i < N; ++i) {
@@ -398,19 +401,18 @@ struct XCache::Impl {
             if (v == kTomb) { continue; }
             uint64_t bid, off;
             decode_slot(v, bid, off);
-            auto [k, vt] = read_key_type(bid, off);
-            if (k != key) { continue; }
+            xcache_value_type_t vt;
+            if (!key_equals_and_type(bid, off, key, &vt)) { continue; }
             if (vt != expected) { exit_read(); return XCACHE_TYPE_MISMATCH; }
-            auto rec = read_record(bid, off);
-            if (rec.expired) {
-                // Lazy expiry: CAS slot to kTomb so future probes skip it.
-                // Best-effort — CAS failure means another thread already handled it.
-                s.state.compare_exchange_strong(v, kTomb,
-                    std::memory_order_acq_rel, std::memory_order_relaxed);
-                exit_read();
-                return XCACHE_EXPIRED;
+            auto [val, expired] = read_value(bid, off, static_cast<uint32_t>(key.size()));
+            if (expired) {
+                // lazy expiry: tombstone the slot so subsequent ops treat it as deleted.
+                // CAS may fail if another thread already removed it — harmless.
+                s.state.compare_exchange_strong(v, kTomb, std::memory_order_acq_rel,
+                                                std::memory_order_relaxed);
+                exit_read(); return XCACHE_EXPIRED;
             }
-            *out = T(parse(std::move(rec)));
+            *out = T(parse(std::move(val)));
             exit_read();
             return XCACHE_OK;
         }
@@ -419,19 +421,19 @@ struct XCache::Impl {
     }
 
     xcache_error_t put_typed(const std::string& key,
-                              xcache_value_type_t type,
-                              const void* data,
-                              size_t size,
-                              uint32_t expire_seconds = 0) {
+                               xcache_value_type_t type,
+                               const void* data,
+                               uint32_t size,
+                               uint32_t expire_seconds = 0) {
         if (!idx_map_) { return XCACHE_IO_ERROR; }
-        if (size > UINT32_MAX) { return XCACHE_INVALID_ARG; }
-        if (size > 0 && !data) { return XCACHE_INVALID_ARG; }
         enter_write();
         auto expire_at = expire_seconds ? static_cast<uint64_t>(std::time(nullptr)) + expire_seconds : 0ULL;
         auto tot = packed_size(key, size);
         auto pos = alloc_data(tot);
         if (!pos) { exit_write(); return XCACHE_NO_SPACE; }
         auto [bid, off] = *pos;
+        // data-before-index: write record to .dat first, then CAS the .idx slot.
+        // crash between these two steps leaves the old slot intact (no dangling pointer).
         write_record(bid, off, key, type, data, size, expire_at);
         if (!try_insert(key, bid, off)) {
             exit_write();
@@ -470,9 +472,6 @@ struct XCache::Impl {
                     }
                     return true;
                 }
-                // CAS failed — another thread modified this slot.
-                // Retry from the same probe position (--i cancels ++i).
-                --i;
                 continue;
             }
             uint64_t eb, eo;
@@ -483,7 +482,6 @@ struct XCache::Impl {
                         std::memory_order_relaxed)) {
                     return true;
                 }
-                --i;
                 continue;
             }
         }
@@ -522,9 +520,9 @@ struct XCache::Impl {
     bool create_block(uint64_t need) {
         std::lock_guard<std::mutex> lk(grow_mtx_);
         auto* h = hdr();
-        auto nb = h->num_blocks.load(std::memory_order_acquire);
+        auto nb = h->num_blocks.load(std::memory_order_relaxed);
         if (nb >= h->max_blocks) { return false; }
-        if (blk_used_of(blk_alloc(nb).raw.load(std::memory_order_acquire)) != 0) {
+        if (blk_used_of(blk_alloc(nb).raw.load(std::memory_order_relaxed)) != 0) {
             h->num_blocks.store(nb + 1, std::memory_order_release);
             return true;
         }
@@ -548,6 +546,9 @@ struct XCache::Impl {
 
     // ── rehash ────────────────────────────────────────────────────
 
+    // Pause writes → drain active ops → build new idx in .tmp →
+    // swap pointers → drain readers still on old pointer → rename .tmp → unpause.
+    // Reads are never blocked (old idx stays mmap'd until drain completes).
     bool rehash() {
         std::lock_guard<std::mutex> lk(rehash_mtx_);
         auto* h = hdr();
@@ -567,7 +568,7 @@ struct XCache::Impl {
         auto is2 = align8(ba2 + kMaxBlks * sizeof(BlkAlloc));
 
         auto tmp = idx_path_ + ".tmp";
-        int fd = ::open(tmp.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0644);
+        int fd = ::open(tmp.c_str(), O_RDWR | O_CREAT, 0644);
         if (fd < 0) { pause_flag_.store(false); return false; }
         if (::ftruncate(fd, static_cast<off_t>(is2)) != 0) {
             ::close(fd); ::unlink(tmp.c_str()); pause_flag_.store(false); return false;
@@ -625,19 +626,13 @@ struct XCache::Impl {
         if (multi_process_) {
             int new_fd = ::open(tmp.c_str(), O_RDWR);
             if (new_fd >= 0) { idx_fd_ = new_fd; }
-            else { idx_fd_ = -1; }
-        }
-
-        munmap(old_map, old_isz);
-        ::close(old_fd);
-        if (!multi_process_) { idx_fd_ = -1; }
-
-        if (::rename(tmp.c_str(), idx_path_.c_str()) != 0) {
-            pause_flag_.store(false, std::memory_order_release);
-            return false;
         }
 
         pause_flag_.store(false, std::memory_order_release);
+
+        munmap(old_map, old_isz);
+        ::close(old_fd);
+        ::rename(tmp.c_str(), idx_path_.c_str());
         last_generation_ = nh->generation.load(std::memory_order_relaxed);
         return true;
     }
@@ -651,9 +646,9 @@ struct XCache::Impl {
         dat_path_  = path + ".dat";
         ::unlink((idx_path_ + ".tmp").c_str());
 
-        idx_fd_ = ::open(idx_path_.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0644);
+        idx_fd_ = ::open(idx_path_.c_str(), O_RDWR | O_CREAT, 0644);
         if (idx_fd_ < 0) { return; }
-        dat_fd_ = ::open(dat_path_.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0644);
+        dat_fd_ = ::open(dat_path_.c_str(), O_RDWR | O_CREAT, 0644);
         if (dat_fd_ < 0) { ::close(idx_fd_); idx_fd_ = -1; return; }
 
         struct stat st;
@@ -730,8 +725,9 @@ struct XCache::Impl {
             if (v == kEmpty || v == kTomb) { continue; }
             uint64_t bid, off;
             decode_slot(v, bid, off);
-            if (is_expired(bid, off)) { continue; }
-            keys.push_back(read_key(bid, off));
+            auto [k, vt] = read_key_type(bid, off);
+            if (is_expired_at(bid, off, static_cast<uint32_t>(k.size()))) { continue; }
+            keys.push_back(std::move(k));
         }
         return keys;
     }
@@ -742,13 +738,7 @@ struct XCache::Impl {
     }
 
     void close_file() {
-        if (!idx_map_ || idx_map_ == MAP_FAILED) {
-            if (idx_fd_ >= 0) { ::close(idx_fd_); idx_fd_ = -1; }
-            if (dat_fd_ >= 0) { ::close(dat_fd_); dat_fd_ = -1; }
-            idx_map_ = nullptr;
-            num_blks_ = 0;
-            return;
-        }
+        if (!idx_map_ || idx_map_ == MAP_FAILED) { return; }
         for (size_t i = 0; i < num_blks_; ++i) {
             if (blk_maps_[i] && blk_maps_[i] != MAP_FAILED) {
                 auto raw = blk_alloc(i).raw.load(std::memory_order_relaxed);
@@ -791,7 +781,7 @@ XCache& XCache::operator=(XCache&& o) noexcept {
 xcache_error_t XCache::put_string(const std::string& key, const std::string& value,
                         uint32_t expire_seconds) {
     return impl_->put_typed(key, XCACHE_TEXT, value.data(),
-                            value.size(), expire_seconds);
+                            static_cast<uint32_t>(value.size()), expire_seconds);
 }
 
 xcache_error_t XCache::put_i64(const std::string& key, int64_t value,
@@ -817,105 +807,97 @@ xcache_error_t XCache::put_bool(const std::string& key, bool value,
 xcache_error_t XCache::put_blob(const std::string& key, const void* data, size_t len,
                       uint32_t expire_seconds) {
     return impl_->put_typed(key, XCACHE_BLOB, data,
-                            len, expire_seconds);
+                            static_cast<uint32_t>(len), expire_seconds);
 }
 xcache_error_t XCache::put_vector(const std::string& key, const void* data, size_t len,
                         uint32_t expire_seconds) {
     return impl_->put_typed(key, XCACHE_VECTOR, data,
-                            len, expire_seconds);
+                            static_cast<uint32_t>(len), expire_seconds);
 }
 xcache_error_t XCache::put_set(const std::string& key, const void* data, size_t len,
-                      uint32_t expire_seconds) {
+                     uint32_t expire_seconds) {
     return impl_->put_typed(key, XCACHE_SET, data,
-                            len, expire_seconds);
+                            static_cast<uint32_t>(len), expire_seconds);
 }
 xcache_error_t XCache::put_map(const std::string& key, const void* data, size_t len,
-                      uint32_t expire_seconds) {
+                     uint32_t expire_seconds) {
     return impl_->put_typed(key, XCACHE_MAP, data,
-                            len, expire_seconds);
+                            static_cast<uint32_t>(len), expire_seconds);
 }
 
 // ── get / typed get ──────────────────────────────────────────────
 
 xcache_error_t XCache::get_string(const std::string& key, std::string* out) const {
     return impl_->key_get_typed(
-        key, XCACHE_TEXT, [](const Record& r) -> std::string {
-            return r.raw_val;
+        key, XCACHE_TEXT, [](std::string raw) -> std::string {
+            return raw;
         }, out);
 }
 
 xcache_error_t XCache::get_i64(const std::string& key, int64_t* out) const {
     return impl_->key_get_typed(
-        key, XCACHE_INT64, [](const Record& r) -> int64_t {
-            int64_t v = 0;
-            if (r.raw_val.size() >= sizeof(v)) { std::memcpy(&v, r.raw_val.data(), sizeof(v)); }
-            return v;
+        key, XCACHE_INT64, [](std::string raw) -> int64_t {
+            int64_t v; std::memcpy(&v, raw.data(), sizeof(v)); return v;
         }, out);
 }
 
 xcache_error_t XCache::get_i32(const std::string& key, int32_t* out) const {
     return impl_->key_get_typed(
-        key, XCACHE_INT32, [](const Record& r) -> int32_t {
-            int32_t v = 0;
-            if (r.raw_val.size() >= sizeof(v)) { std::memcpy(&v, r.raw_val.data(), sizeof(v)); }
-            return v;
+        key, XCACHE_INT32, [](std::string raw) -> int32_t {
+            int32_t v; std::memcpy(&v, raw.data(), sizeof(v)); return v;
         }, out);
 }
 
 xcache_error_t XCache::get_f32(const std::string& key, float* out) const {
     return impl_->key_get_typed(
-        key, XCACHE_FLOAT, [](const Record& r) -> float {
-            float v = 0;
-            if (r.raw_val.size() >= sizeof(v)) { std::memcpy(&v, r.raw_val.data(), sizeof(v)); }
-            return v;
+        key, XCACHE_FLOAT, [](std::string raw) -> float {
+            float v; std::memcpy(&v, raw.data(), sizeof(v)); return v;
         }, out);
 }
 
 xcache_error_t XCache::get_f64(const std::string& key, double* out) const {
     return impl_->key_get_typed(
-        key, XCACHE_DOUBLE, [](const Record& r) -> double {
-            double v = 0;
-            if (r.raw_val.size() >= sizeof(v)) { std::memcpy(&v, r.raw_val.data(), sizeof(v)); }
-            return v;
+        key, XCACHE_DOUBLE, [](std::string raw) -> double {
+            double v; std::memcpy(&v, raw.data(), sizeof(v)); return v;
         }, out);
 }
 
 xcache_error_t XCache::get_bool(const std::string& key, bool* out) const {
     return impl_->key_get_typed(
-        key, XCACHE_BOOLEAN, [](const Record& r) -> bool {
-            return r.raw_val.size() > 0 && r.raw_val[0] != 0;
+        key, XCACHE_BOOLEAN, [](std::string raw) -> bool {
+            return !raw.empty() && raw[0] != 0;
         }, out);
 }
 
 xcache_error_t XCache::get_blob(const std::string& key, std::vector<uint8_t>* out) const {
     return impl_->key_get_typed(
-        key, XCACHE_BLOB, [](const Record& r) -> std::vector<uint8_t> {
-            auto p = reinterpret_cast<const uint8_t*>(r.raw_val.data());
-            return std::vector<uint8_t>(p, p + r.raw_val.size());
+        key, XCACHE_BLOB, [](std::string raw) -> std::vector<uint8_t> {
+            auto p = reinterpret_cast<const uint8_t*>(raw.data());
+            return std::vector<uint8_t>(p, p + raw.size());
         }, out);
 }
 
 xcache_error_t XCache::get_vector(const std::string& key, std::vector<uint8_t>* out) const {
     return impl_->key_get_typed(
-        key, XCACHE_VECTOR, [](const Record& r) -> std::vector<uint8_t> {
-            auto p = reinterpret_cast<const uint8_t*>(r.raw_val.data());
-            return std::vector<uint8_t>(p, p + r.raw_val.size());
+        key, XCACHE_VECTOR, [](std::string raw) -> std::vector<uint8_t> {
+            auto p = reinterpret_cast<const uint8_t*>(raw.data());
+            return std::vector<uint8_t>(p, p + raw.size());
         }, out);
 }
 
 xcache_error_t XCache::get_set(const std::string& key, std::vector<uint8_t>* out) const {
     return impl_->key_get_typed(
-        key, XCACHE_SET, [](const Record& r) -> std::vector<uint8_t> {
-            auto p = reinterpret_cast<const uint8_t*>(r.raw_val.data());
-            return std::vector<uint8_t>(p, p + r.raw_val.size());
+        key, XCACHE_SET, [](std::string raw) -> std::vector<uint8_t> {
+            auto p = reinterpret_cast<const uint8_t*>(raw.data());
+            return std::vector<uint8_t>(p, p + raw.size());
         }, out);
 }
 
 xcache_error_t XCache::get_map(const std::string& key, std::vector<uint8_t>* out) const {
     return impl_->key_get_typed(
-        key, XCACHE_MAP, [](const Record& r) -> std::vector<uint8_t> {
-            auto p = reinterpret_cast<const uint8_t*>(r.raw_val.data());
-            return std::vector<uint8_t>(p, p + r.raw_val.size());
+        key, XCACHE_MAP, [](std::string raw) -> std::vector<uint8_t> {
+            auto p = reinterpret_cast<const uint8_t*>(raw.data());
+            return std::vector<uint8_t>(p, p + raw.size());
         }, out);
 }
 
@@ -932,14 +914,13 @@ xcache_error_t XCache::get_type(const std::string& key, xcache_value_type_t* out
         if (v == kTomb) { continue; }
         uint64_t bid, off;
         decode_slot(v, bid, off);
-        auto [k, vt] = I.read_key_type(bid, off);
-        if (k == key) {
+        xcache_value_type_t vt;
+        if (I.key_equals_and_type(bid, off, key, &vt)) {
             if (I.is_expired(bid, off)) {
-                // Lazy expiry: CAS slot to kTomb so future probes skip it.
-                s.state.compare_exchange_strong(v, kTomb,
-                    std::memory_order_acq_rel, std::memory_order_relaxed);
-                I.exit_read();
-                return XCACHE_EXPIRED;
+                // lazy expiry
+                s.state.compare_exchange_strong(v, kTomb, std::memory_order_acq_rel,
+                                                std::memory_order_relaxed);
+                I.exit_read(); return XCACHE_EXPIRED;
             }
             *out = vt;
             I.exit_read();
@@ -966,14 +947,15 @@ bool XCache::exists(const std::string& key) const {
         if (v == kTomb) { continue; }
         uint64_t bid, off;
         decode_slot(v, bid, off);
-        if (I.read_key(bid, off) == key) {
+        if (I.key_equals(bid, off, key)) {
             if (I.is_expired(bid, off)) {
-                // Lazy expiry: CAS slot to kTomb so future probes skip it.
-                s.state.compare_exchange_strong(v, kTomb,
-                    std::memory_order_acq_rel, std::memory_order_relaxed);
-                break;
+                // lazy expiry: same CAS pattern as key_get_typed
+                s.state.compare_exchange_strong(v, kTomb, std::memory_order_acq_rel,
+                                                std::memory_order_relaxed);
+                found = false;
+            } else {
+                found = true;
             }
-            found = true;
             break;
         }
     }
@@ -994,7 +976,7 @@ xcache_error_t XCache::remove(const std::string& key) {
         if (v == kTomb) { continue; }
         uint64_t bid, off;
         decode_slot(v, bid, off);
-        if (I.read_key(bid, off) == key) {
+        if (I.key_equals(bid, off, key)) {
             if (s.state.compare_exchange_strong(
                     v, kTomb, std::memory_order_acq_rel,
                     std::memory_order_relaxed)) {
@@ -1030,22 +1012,9 @@ void XCache::close() {
 }
 
 xcache_error_t XCache::rebuild() {
-    //
-    // Compacts the .dat file: copies all live entries into a fresh
-    // pair of (.idx, .dat) files, then atomically swaps them in.
-    // Reads are never blocked; writes are paused only during the swap.
-    //
-    //  1. Pause writers, wait for all in-flight ops to drain
-    //  2. Build a temp Impl with fresh .rebuild.idx + .rebuild.dat
-    //     — copy every non-expired entry from the current index into tmp
-    //  3. Swap: rename temp files onto real paths, open them as new I
-    //  4. Drain any readers still using old pointer, then free old resources
-    //  5. Unpause writers
-    //
     auto& I = *impl_;
     if (!I.idx_map_) { return XCACHE_IO_ERROR; }
 
-    std::lock_guard<std::mutex> lk(I.rehash_mtx_);
     I.pause_flag_.store(true, std::memory_order_release);
     while (I.active_ops_.load(std::memory_order_acquire) > 0) {
         std::this_thread::yield();
@@ -1054,7 +1023,6 @@ xcache_error_t XCache::rebuild() {
     auto blk_sz = I.hdr()->default_block_size;
     auto multi  = I.multi_process_;
 
-    // ── step 2: build temp copy ────────────────────────────────────
     auto tmp_path = I.base_path_ + ".rebuild";
     bool ok = false;
     {
@@ -1071,7 +1039,7 @@ xcache_error_t XCache::rebuild() {
                 if (I.is_expired(bid, off)) { continue; }
                 auto rec = I.read_record(bid, off);
                 if (tmp.put_typed(rec.key, rec.type, rec.raw_val.data(),
-                                   rec.raw_val.size()) != XCACHE_OK) {
+                                   static_cast<uint32_t>(rec.raw_val.size())) != XCACHE_OK) {
                     ok = false;
                     break;
                 }
@@ -1080,7 +1048,6 @@ xcache_error_t XCache::rebuild() {
         tmp.close_file();
     }
 
-    // copy failed — discard temp files, resume writers, done
     if (!ok) {
         ::unlink((tmp_path + ".idx").c_str());
         ::unlink((tmp_path + ".dat").c_str());
@@ -1088,8 +1055,7 @@ xcache_error_t XCache::rebuild() {
         return XCACHE_NO_SPACE;
     }
 
-    // ── step 3: atomic swap ────────────────────────────────────────
-    // save old I's state (inodes stay alive via saved fds/mmaps)
+    // save old state before swap (same style as rehash)
     auto* old_idx_map   = I.idx_map_;
     auto  old_idx_fd    = I.idx_fd_;
     auto  old_dat_fd    = I.dat_fd_;
@@ -1103,37 +1069,18 @@ xcache_error_t XCache::rebuild() {
             I.blk_alloc(i).raw.load(std::memory_order_relaxed));
     }
 
-    // rename .rebuild files onto real paths
-    // failure: temp .dat is unlinked; old files (still open via
-    // saved fds/mmaps) remain the current active state.
-    if (::rename((tmp_path + ".idx").c_str(), I.idx_path_.c_str()) != 0) {
-        ::unlink((tmp_path + ".dat").c_str());
-        I.pause_flag_.store(false, std::memory_order_release);
-        return XCACHE_IO_ERROR;
-    }
-    if (::rename((tmp_path + ".dat").c_str(), I.dat_path_.c_str()) != 0) {
-        ::rename(I.idx_path_.c_str(), (tmp_path + ".idx").c_str());
-        I.pause_flag_.store(false, std::memory_order_release);
-        return XCACHE_IO_ERROR;
-    }
+    // rename first — old inode stays alive via I's existing fd+mmap
+    ::rename((tmp_path + ".idx").c_str(), I.idx_path_.c_str());
+    ::rename((tmp_path + ".dat").c_str(), I.dat_path_.c_str());
 
-    // open the now-replaced files as the new I
-    // failure: rename the rebuild files back to .rebuild paths so
-    // they can be inspected or retried; old I state was never
-    // destroyed — the caller can continue using the cache normally.
     I.open_file(I.base_path_, blk_sz, multi);
-    if (!I.idx_map_ || I.idx_map_ == MAP_FAILED) {
-        ::rename(I.idx_path_.c_str(), (tmp_path + ".idx").c_str());
-        ::rename(I.dat_path_.c_str(), (tmp_path + ".dat").c_str());
-        I.pause_flag_.store(false, std::memory_order_release);
-        return XCACHE_IO_ERROR;
-    }
 
-    // ── step 4: drain readers, release old resources ───────────────
+    // drain readers that may still hold old pointer
     while (I.active_ops_.load(std::memory_order_acquire) > 0) {
         std::this_thread::yield();
     }
 
+    // cleanup old — same style as rehash
     for (size_t i = 0; i < old_num_blks; ++i) {
         if (old_blk_maps[i] && old_blk_maps[i] != MAP_FAILED) {
             ::munmap(old_blk_maps[i], old_blk_szs[i]);
@@ -1145,7 +1092,6 @@ xcache_error_t XCache::rebuild() {
     if (old_idx_fd >= 0)  { ::close(old_idx_fd); }
     if (old_dat_fd >= 0)  { ::close(old_dat_fd); }
 
-    // ── step 5: done ───────────────────────────────────────────────
     I.pause_flag_.store(false, std::memory_order_release);
     return XCACHE_OK;
 }
@@ -1160,8 +1106,8 @@ void XCache::scan(const ScanFn& fn) const {
         if (v == kEmpty || v == kTomb) { continue; }
         uint64_t bid, off;
         decode_slot(v, bid, off);
-        if (I.is_expired(bid, off)) { continue; }
         auto [k, vt] = I.read_key_type(bid, off);
+        if (I.is_expired_at(bid, off, static_cast<uint32_t>(k.size()))) { continue; }
         if (!fn(k, vt)) { break; }
     }
     I.exit_read();
