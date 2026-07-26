@@ -152,11 +152,16 @@ struct Record {
     xcache_value_type_t type;
     std::string raw_val;
     bool expired = false;
+    uint64_t expire_at = 0;
 };
 
 // ── implementation ───────────────────────────────────────────────
 
 struct XCache::Impl {
+    struct DeferredMunmap { void* addr; size_t size; int fd; };
+    mutable std::vector<DeferredMunmap> deferred_munmaps_;
+    mutable std::mutex deferred_mtx_;
+
     mutable void*  idx_map_      = nullptr;
     mutable int    idx_fd_       = -1;
     int    dat_fd_       = -1;
@@ -205,6 +210,7 @@ struct XCache::Impl {
         if (multi_process_) {
             xc_unlock(idx_fd_);
         }
+        process_deferred_munmaps();
     }
 
     void enter_write() const {
@@ -229,6 +235,21 @@ struct XCache::Impl {
         if (multi_process_) {
             xc_unlock(idx_fd_);
         }
+        process_deferred_munmaps();
+    }
+
+    // ── deferred munmap cleanup ──────────────────────────────────
+
+    void process_deferred_munmaps() const {
+        if (deferred_munmaps_.empty()) return;
+        if (active_ops_.load(std::memory_order_acquire) > 0) return;
+        std::lock_guard<std::mutex> lk(deferred_mtx_);
+        if (active_ops_.load(std::memory_order_acquire) > 0) return; // double-check
+        for (auto& d : deferred_munmaps_) {
+            if (d.addr && d.addr != MAP_FAILED) munmap(d.addr, d.size);
+            if (d.fd >= 0) ::close(d.fd);
+        }
+        deferred_munmaps_.clear();
     }
 
     // ── multi-process remap ───────────────────────────────────────
@@ -258,8 +279,11 @@ struct XCache::Impl {
         idx_fd_  = new_fd;
         last_generation_ = gen;
 
-        munmap(old_map, old_sz);
-        ::close(old_fd);
+        {
+            std::lock_guard<std::mutex> lk(deferred_mtx_);
+            deferred_munmaps_.push_back({old_map, old_sz, old_fd});
+        }
+        process_deferred_munmaps();
     }
 
     // ── pack / read / write ────────────────────────────────────────
@@ -303,10 +327,10 @@ struct XCache::Impl {
         uint32_t vsz; std::memcpy(&vsz, p, 4); p += 4;
         uint64_t expire_at; std::memcpy(&expire_at, p, 8); p += 8;
         if (expire_at != 0 && static_cast<uint64_t>(std::time(nullptr)) > expire_at) {
-            return {std::move(key), static_cast<xcache_value_type_t>(vt), std::string{}, true};
+            return {std::move(key), static_cast<xcache_value_type_t>(vt), std::string{}, true, expire_at};
         }
         std::string val(p, vsz);
-        return {std::move(key), static_cast<xcache_value_type_t>(vt), std::move(val)};
+        return {std::move(key), static_cast<xcache_value_type_t>(vt), std::move(val), false, expire_at};
     }
 
     std::string read_key(uint64_t bid, uint64_t off) const {
@@ -409,8 +433,10 @@ struct XCache::Impl {
             if (expired) {
                 // lazy expiry: tombstone the slot so subsequent ops treat it as deleted.
                 // CAS may fail if another thread already removed it — harmless.
-                s.state.compare_exchange_strong(v, kTomb, std::memory_order_acq_rel,
-                                                std::memory_order_relaxed);
+                if (s.state.compare_exchange_strong(v, kTomb, std::memory_order_acq_rel,
+                                                    std::memory_order_relaxed)) {
+                    hdr()->num_entries.fetch_sub(1, std::memory_order_relaxed);
+                }
                 exit_read(); return XCACHE_EXPIRED;
             }
             *out = T(parse(std::move(val)));
@@ -442,7 +468,17 @@ struct XCache::Impl {
             exit_write();
             auto ok = rehash() && try_insert(key, bid, off);
             enter_write();
-            if (!ok) { exit_write(); return XCACHE_NO_SPACE; }
+            if (!ok) {
+                // Rollback: decrement the block's used counter
+                auto& ba = blk_alloc(bid);
+                auto raw = ba.raw.load(std::memory_order_acquire);
+                auto bsz = blk_sz_of(raw);
+                auto used = blk_used_of(raw);
+                auto rollback = used >= static_cast<uint64_t>(tot) ? used - static_cast<uint64_t>(tot) : 0;
+                ba.raw.store(blk_encode_r(bsz, rollback), std::memory_order_release);
+                exit_write();
+                return XCACHE_NO_SPACE;
+            }
         }
         auto* hd = hdr();
         auto  ne = hd->num_entries.load(std::memory_order_relaxed);
@@ -743,7 +779,6 @@ struct XCache::Impl {
     }
 
     void close_file() {
-        if (!idx_map_ || idx_map_ == MAP_FAILED) { return; }
         for (size_t i = 0; i < num_blks_; ++i) {
             if (blk_maps_[i] && blk_maps_[i] != MAP_FAILED) {
                 auto raw = blk_alloc(i).raw.load(std::memory_order_relaxed);
@@ -751,11 +786,14 @@ struct XCache::Impl {
                 blk_maps_[i] = nullptr;
             }
         }
-        if (idx_map_ != MAP_FAILED) { munmap(idx_map_, idx_sz()); }
+        if (idx_map_ && idx_map_ != MAP_FAILED) {
+            munmap(idx_map_, idx_sz());
+        }
         idx_map_ = nullptr;
         if (idx_fd_ >= 0) { ::close(idx_fd_); idx_fd_ = -1; }
         if (dat_fd_ >= 0) { ::close(dat_fd_); dat_fd_ = -1; }
         num_blks_ = 0;
+        process_deferred_munmaps();
     }
 };
 
@@ -919,8 +957,10 @@ xcache_error_t XCache::get_type(const std::string& key, xcache_value_type_t* out
         if (I.key_equals_and_type(bid, off, key, &vt)) {
             if (I.is_expired(bid, off)) {
                 // lazy expiry
-                s.state.compare_exchange_strong(v, kTomb, std::memory_order_acq_rel,
-                                                std::memory_order_relaxed);
+                if (s.state.compare_exchange_strong(v, kTomb, std::memory_order_acq_rel,
+                                                    std::memory_order_relaxed)) {
+                    I.hdr()->num_entries.fetch_sub(1, std::memory_order_relaxed);
+                }
                 I.exit_read(); return XCACHE_EXPIRED;
             }
             *out = vt;
@@ -951,8 +991,10 @@ bool XCache::exists(const std::string& key) const {
         if (I.key_equals(bid, off, key)) {
             if (I.is_expired(bid, off)) {
                 // lazy expiry: same CAS pattern as key_get_typed
-                s.state.compare_exchange_strong(v, kTomb, std::memory_order_acq_rel,
-                                                std::memory_order_relaxed);
+                if (s.state.compare_exchange_strong(v, kTomb, std::memory_order_acq_rel,
+                                                    std::memory_order_relaxed)) {
+                    I.hdr()->num_entries.fetch_sub(1, std::memory_order_relaxed);
+                }
                 found = false;
             } else {
                 found = true;
@@ -1040,8 +1082,13 @@ xcache_error_t XCache::rebuild() {
                 if (I.is_expired(bid, off)) { continue; }
                 auto rec = I.read_record(bid, off);
                 if (rec.expired) { continue; }  // TTL may expire between check and read
+                // Preserve remaining TTL
+                auto expire_seconds = rec.expire_at ? static_cast<uint32_t>(
+                    rec.expire_at > static_cast<uint64_t>(std::time(nullptr))
+                    ? rec.expire_at - static_cast<uint64_t>(std::time(nullptr))
+                    : 0ULL) : 0U;
                 if (tmp.put_typed(rec.key, rec.type, rec.raw_val.data(),
-                                   rec.raw_val.size()) != XCACHE_OK) {
+                                   rec.raw_val.size(), expire_seconds) != XCACHE_OK) {
                     ok = false;
                     break;
                 }

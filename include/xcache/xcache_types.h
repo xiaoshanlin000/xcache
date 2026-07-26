@@ -24,7 +24,8 @@ typedef enum {
     XCACHE_EXPIRED       = 3,
     XCACHE_NO_SPACE      = 4,
     XCACHE_IO_ERROR      = 5,
-    XCACHE_INVALID_ARG   = 6,
+    XCACHE_INVALID_ARG    = 6,
+    XCACHE_INTERNAL_ERROR = 7,
 } xcache_error_t;
 
 typedef struct {
