@@ -46,3 +46,4 @@ compile_commands.json
 .omo/
 **/AGENTS.md
 .cache/
+.tasks/

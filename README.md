@@ -79,6 +79,7 @@ put:  serialize → alloc(.dat 尾部) → memcpy → CAS 改 .idx slot
 |------|------|------|
 | `path.idx` | 哈希索引表（mmap） | 4KB Header + N × 8B Slot，开放定址 + 线性探测，初始 64K slots，70% 负载自动 1.5x 扩容 |
 | `path.dat` | 数据块（链式 mmap，追加写入） | 记录顺序追加，旧数据占用的空间由 `rebuild()` 回收 |
+| `path.lock` | 跨进程 flock 载体（多进程模式） | 永不 rename，保证 rehash/rebuild 换文件后锁不失效 |
 
 单 block 最大 1TB（40 位偏移），最多 256 个 block，总容量上限 **256TB**。
 
@@ -89,7 +90,9 @@ put:  serialize → alloc(.dat 尾部) → memcpy → CAS 改 .idx slot
 | put | CAS 在 `.dat` 尾部分配空间 → memcpy 写入数据 → CAS 修改 `.idx` slot |
 | remove | CAS 将 slot 标记为墓碑（kTomb），`.dat` 数据不动，`rebuild()` 回收空间 |
 | rehash | 暂停写 → 新建 `.idx.tmp` → 重插所有 entry → 原子切换 → 恢复写（读全程不阻塞） |
-| rebuild | 暂停写 → 新建 `.idx+.dat.tmp` → 拷贝有效 entry → rename 替换 → 恢复写（读全程不阻塞） |
+| rebuild | 暂停写 → 冻结读（仅换指针瞬间，微秒级）→ 新建 `.idx+.dat.tmp` → 拷贝有效 entry → rename 替换 → 恢复读写 |
+
+> 注意：`scan()` / `get_all_keys()` 的回调或遍历中不要调用 put/remove/rebuild 等写操作——它们可能触发 rehash/rebuild，而后者要等当前读操作排空，会造成死锁。
 
 ### 懒过期（Lazy Expiry）
 
@@ -105,8 +108,10 @@ put:  serialize → alloc(.dat 尾部) → memcpy → CAS 改 .idx slot
 |------|------|
 | 不同 key 读写 | 互不阻塞，CAS 原子操作 |
 | 同 key put/remove | CAS 保证操作完整 |
-| rebuild / rehash | 暂停写，读不受影响 |
-| 多进程 | 读 LOCK_SH / 写 LOCK_EX + generation 版本号自动 remap；多进程模式每次操作有 flock 开销，单核吞吐约为单进程的 60–70% |
+| rebuild / rehash | 进程内暂停写、读基本不受影响（rebuild 换指针瞬间读自旋等待）；多进程模式下整个操作持 EX 锁，其他进程的操作会等待，保证不丢写 |
+| 多进程 | `path.lock` 上读 LOCK_SH / 写 LOCK_EX；每次操作比较 `path.idx` 的 inode，被其他进程 rehash/rebuild 替换后自动重映射（.dat 一并检查，避免新旧文件错配）；多进程模式每次操作有 flock+stat 开销，单核吞吐约为单进程的 50–65% |
+
+> 多进程模式同样支持每进程多线程：进程内线程互斥靠 CAS + pause/drain（与单进程模式相同），跨进程互斥靠 `path.lock` 的 flock。flock 是 open-file-description 级锁，进程内所有线程共享同一把，不会额外互斥。epoch 计数器为 4 字节原子，保证所有平台 lock-free。
 
 ## 持久化保证
 
@@ -128,8 +133,8 @@ xcache 的持久化策略围绕一个核心权衡：**要速度就不能每次�
 
 | 操作 | 做什么 | 何时调用 |
 |------|--------|----------|
-| `sync()` | 将 `.idx` 刷到磁盘 | 写入重要数据后调用确保持久化；close 前一般不需调（析构函数自动 sync 兜底） |
-| `rebuild()` | 压缩墓碑和过期 key，回收 `.dat` 空间 | 删除大量 key 或 TTL 过期后想释放磁盘空间时调用；重建期间写暂停，读不阻塞 |
+| `sync()` | 先刷 `.dat` 再刷 `.idx`（保持 data-before-index 的落盘顺序） | 写入重要数据后调用确保持久化；close 前一般不需调（析构函数自动 sync 兜底） |
+| `rebuild()` | 压缩墓碑和过期 key，回收 `.dat` 空间 | 删除大量 key 或 TTL 过期后想释放磁盘空间时调用；重建期间写暂停，读仅在换指针瞬间短暂等待 |
 
 ## 需要注意的行为
 

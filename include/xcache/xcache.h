@@ -117,6 +117,9 @@ class XCache {
 
     xcache_error_t rebuild();
 
+    // 遍历全部有效 key(跳过过期/已删除)。回调返回 false 提前停止。
+    // 注意:回调内不要调用 put/remove/rebuild 等写操作——它们可能触发
+    // rehash/rebuild,而后者要等当前读操作排空,会造成死锁。
     using ScanFn = std::function<bool(const std::string& key, xcache_value_type_t type)>;
 
     void scan(const ScanFn& fn) const;

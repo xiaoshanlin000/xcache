@@ -79,6 +79,7 @@ No path to half-written data exists. This is why xcache **needs no CRC** — wri
 |------|------|-----------|
 | `path.idx` | Hash index table (mmap) | 4KB Header + N × 8B Slot, open addressing + linear probing, initial 64K slots, 1.5x auto-grow at 70% load |
 | `path.dat` | Data blocks (chained mmap, append-only) | Records appended sequentially, old data reclaimed by `rebuild()` |
+| `path.lock` | Cross-process flock carrier (multi-process mode) | Never renamed, so the lock survives rehash/rebuild file replacement |
 
 Single block max 1TB (40-bit offset), 256 blocks max, total **256TB**.
 
@@ -89,7 +90,7 @@ Single block max 1TB (40-bit offset), 256 blocks max, total **256TB**.
 | put | CAS alloc at `.dat` tail → memcpy data → CAS `.idx` slot |
 | remove | CAS slot to tombstone (kTomb), `.dat` untouched, reclaimed by `rebuild()` |
 | rehash | Pause writes → new `.idx.tmp` → rehash entries → atomic swap → resume (reads never block) |
-| rebuild | Pause writes → new `.idx+.dat.tmp` → copy live entries → rename → resume (reads never block) |
+| rebuild | Pause writes → freeze reads (only during the pointer swap, microseconds) → new `.idx+.dat.tmp` → copy live entries → rename → resume |
 
 ### Lazy Expiry
 
@@ -105,8 +106,8 @@ When `get` / `exists` / `get_type` encounter an expired key, they **automaticall
 |----------|-----------|
 | Different keys | Non-blocking, CAS operations |
 | Same key put/remove | CAS guarantees integrity |
-| rebuild / rehash | Pause writes, reads unaffected |
-| Multi-process | Read LOCK_SH / Write LOCK_EX + generation auto-remap; flock overhead reduces single-core throughput to ~60–70% of single-process mode |
+| rebuild / rehash | In-process: pause writes, reads basically unaffected (readers spin only during the rebuild pointer swap); multi-process: holds the EX lock for the whole operation, other processes wait — no writes are lost |
+| Multi-process | Read LOCK_SH / Write LOCK_EX on `path.lock`; every op compares the `path.idx` inode and auto-remaps (`.dat` checked too, avoiding idx/dat mismatch) after another process rehash/rebuild; flock+stat overhead reduces single-core throughput to ~50–65% of single-process mode |
 
 ## Durability Guarantee
 
@@ -128,8 +129,8 @@ Call `sync()` after writes for stronger durability. Destructor auto-syncs, so ma
 
 | Call | What it does | When to call |
 |------|-------------|--------------|
-| `sync()` | Flushes `.idx` to disk | After writing important data; destructor syncs automatically — usually not needed before close |
-| `rebuild()` | Compacts tombstones and expired keys, reclaims `.dat` space | After deleting many keys or TTL expiry — writes pause during rebuild, reads don't block |
+| `sync()` | Flushes `.dat` first, then `.idx` (preserving data-before-index order) | After writing important data; destructor syncs automatically — usually not needed before close |
+| `rebuild()` | Compacts tombstones and expired keys, reclaims `.dat` space | After deleting many keys or TTL expiry — writes pause during rebuild, reads wait only during the brief pointer swap |
 
 ## Behavior Notes
 
